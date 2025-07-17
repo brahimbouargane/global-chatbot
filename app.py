@@ -1,114 +1,223 @@
 import streamlit as st
-from dotenv import load_dotenv
-import pickle
+import openai
 from PyPDF2 import PdfReader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.llms import OpenAI
-from langchain.chains.question_answering import load_qa_chain
-from langchain.callbacks import get_openai_callback
 import os
- 
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables
 load_dotenv()
- 
-def main():
-    st.header("LLM-powered PDF Chatbot 💬")
- 
- 
-    # upload a PDF file
-    pdf = st.file_uploader("Upload your PDF", type='pdf')
- 
-    # st.write(pdf)
-    if pdf is not None:
-        pdf_reader = PdfReader(pdf)
-        
+
+# CUSTOMIZE THIS SECTION
+PROJECT_NAME = "My PDF Chatbot"
+COMPANY_NAME = "Your Company"
+PDF_FILE_PATH = "data/reforming-modernity.pdf"
+
+# Get OpenAI API key from environment
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai.api_key = OPENAI_API_KEY
+
+# Page configuration
+st.set_page_config(page_title=PROJECT_NAME, page_icon="🤖", layout="wide")
+
+# Custom CSS for better styling
+st.markdown("""
+<style>
+    .chat-message {
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin-bottom: 1rem;
+        display: flex;
+        flex-direction: column;
+              color : #000;
+    }
+    .user-message {
+        background-color: #e3f2fd;
+        border-left: 4px solid #2196f3;
+        color : #000;
+    }
+    .assistant-message {
+        background-color: #f5f5f5;
+        border-left: 4px solid #4caf50;
+        text : #000;
+    }
+    .message-header {
+        font-weight: bold;
+        margin-bottom: 0.5rem;
+            text : #000;
+    }
+    .pdf-info {
+        background-color: #f0f8ff;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border-left: 4px solid #007acc;
+            text : #000;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Initialize session state
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
+if 'pdf_content' not in st.session_state:
+    st.session_state.pdf_content = None
+if 'pdf_loaded' not in st.session_state:
+    st.session_state.pdf_loaded = False
+
+@st.cache_data
+def load_pdf():
+    """Load PDF from project with better error handling"""
+    pdf_path = Path(PDF_FILE_PATH)
+    
+    if not pdf_path.exists():
+        return None, f"PDF file not found: {PDF_FILE_PATH}"
+    
+    try:
+        reader = PdfReader(PDF_FILE_PATH)
         text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text()
- 
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len
-            )
-        chunks = text_splitter.split_text(text=text)
- 
-        # # embeddings
-        store_name = pdf.name[:-4]
-        st.write(f'{store_name}')
-        # st.write(chunks)
- 
-        if os.path.exists(f"{store_name}.pkl"):
-            with open(f"{store_name}.pkl", "rb") as f:
-                VectorStore = pickle.load(f)
-            # st.write('Embeddings Loaded from the Disk')s
+        total_pages = len(reader.pages)
+        
+        for page_num, page in enumerate(reader.pages):
+            page_text = page.extract_text()
+            if page_text.strip():  # Only add non-empty pages
+                text += f"\n--- Page {page_num + 1} ---\n"
+                text += page_text
+        
+        return text, f"Successfully loaded {total_pages} pages"
+    except Exception as e:
+        return None, f"Error reading PDF: {str(e)}"
+
+def get_pdf_info(pdf_content):
+    """Get basic info about the PDF"""
+    if not pdf_content:
+        return {}
+    
+    lines = pdf_content.split('\n')
+    pages = pdf_content.count('--- Page')
+    words = len(pdf_content.split())
+    characters = len(pdf_content)
+    
+    return {
+        'pages': pages,
+        'lines': len(lines),
+        'words': words,
+        'characters': characters
+    }
+
+def get_ai_response(question, pdf_content):
+    """Generate response using OpenAI API"""
+    simple_greetings = ['hello', 'hi', 'hey']
+    question_clean = question.lower().strip()
+    
+    if question_clean in simple_greetings:
+        return f"Hello! 👋 Welcome to {PROJECT_NAME}. Ask me anything about your PDF!"
+    
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": f"Answer questions about this PDF: {pdf_content[:10000]}"},
+                {"role": "user", "content": question}
+            ],
+            max_tokens=500,
+            temperature=0.3
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+def main():
+    st.title(f"📄 {PROJECT_NAME}")
+    st.markdown(f"*Powered by {COMPANY_NAME}*")
+    
+    # Check if API key is available
+    if not OPENAI_API_KEY:
+        st.error("❌ OpenAI API key not found!")
+        st.info("Please add your OpenAI API key to the `.env` file:")
+        st.code("OPENAI_API_KEY=sk-your-api-key-here")
+        st.stop()
+    
+    # Sidebar for PDF info
+    with st.sidebar:
+        st.header("📄 Document Info")
+        
+        # Load PDF
+        if st.session_state.pdf_content is None:
+            with st.spinner("Loading PDF..."):
+                pdf_content, message = load_pdf()
+                st.session_state.pdf_content = pdf_content
+                st.session_state.pdf_loaded = pdf_content is not None
+        
+        if st.session_state.pdf_loaded:
+            st.success("✅ PDF loaded successfully!")
+            
+            # Show PDF info
+            pdf_info = get_pdf_info(st.session_state.pdf_content)
+            st.markdown(f"""
+            **File:** `{Path(PDF_FILE_PATH).name}`  
+            **Pages:** {pdf_info['pages']}  
+            **Words:** {pdf_info['words']:,}  
+            **Characters:** {pdf_info['characters']:,}
+            """)
+            
+            # PDF Preview
+            with st.expander("📖 Document Preview"):
+                preview_text = st.session_state.pdf_content[:1000]
+                st.text_area(
+                    "First 1000 characters",
+                    preview_text + "..." if len(st.session_state.pdf_content) > 1000 else preview_text,
+                    height=200,
+                    disabled=True
+                )
         else:
-            embeddings = OpenAIEmbeddings()
-            VectorStore = FAISS.from_texts(chunks, embedding=embeddings)
-            with open(f"{store_name}.pkl", "wb") as f:
-                pickle.dump(VectorStore, f)
- 
-        # embeddings = OpenAIEmbeddings()
-        # VectorStore = FAISS.from_texts(chunks, embedding=embeddings)
- 
-        # Accept user questions/query
-        query = st.text_input("Ask questions about your PDF file:")
-        # st.write(query)
- 
-        if query:
-            docs = VectorStore.similarity_search(query=query, k=3)
- 
-            llm = OpenAI()
-            chain = load_qa_chain(llm=llm, chain_type="stuff")
-            with get_openai_callback() as cb:
-                response = chain.run(input_documents=docs, question=query)
-                print(cb)
-            st.write(response)
- 
+            st.error("❌ Failed to load PDF")
+            if 'message' in locals():
+                st.error(message)
+        
+        # Clear chat button
+        if st.button("🗑️ Clear Chat"):
+            st.session_state.messages = []
+            st.rerun()
+    
+    # Main chat interface
+    if not st.session_state.pdf_loaded:
+        st.error("Please check that your PDF file exists at the specified path and try again.")
+        st.info(f"Looking for: `{PDF_FILE_PATH}`")
+        return
+    
+    # Chat container
+    st.markdown("### 💬 Chat with your PDF")
+    
+    # Display chat messages
+    for message in st.session_state.messages:
+        if message["role"] == "user":
+            st.markdown(f"""
+            <div class="chat-message user-message">
+                <div class="message-header">🙋 You</div>
+                <div>{message["content"]}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div class="chat-message assistant-message">
+                <div class="message-header">🤖 Assistant</div>
+                <div>{message["content"]}</div>
+            </div>
+            """, unsafe_allow_html=True)
+    
+    # Chat input
+    if prompt := st.chat_input("Ask me anything about your PDF document..."):
+        # Add user message
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        
+        # Generate and add AI response
+        with st.spinner("Analyzing document..."):
+            response = get_ai_response(prompt, st.session_state.pdf_content)
+        
+        st.session_state.messages.append({"role": "assistant", "content": response})
+        
+        # Rerun to update chat
+        st.rerun()
+
 if __name__ == '__main__':
     main()
-    
-def set_bg_from_url(url, opacity=1):
-    
-    footer = """
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.0/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-gH2yIJqKdNHPEq0n4Mqa/HGKIhSkIHeL5AyhkYV8i59U5AR6csBvApHHNl/vI1Bx" crossorigin="anonymous">
-    <footer>
-        <div style='visibility: visible;margin-top:7rem;justify-content:center;display:flex;'>
-            <p style="font-size:1.1rem;">
-                Made by Mohamed Shaad
-                &nbsp;
-                <a href="https://www.linkedin.com/in/mohamedshaad">
-                    <svg xmlns="http://www.w3.org/2000/svg" width="23" height="23" fill="white" class="bi bi-linkedin" viewBox="0 0 16 16">
-                        <path d="M0 1.146C0 .513.526 0 1.175 0h13.65C15.474 0 16 .513 16 1.146v13.708c0 .633-.526 1.146-1.175 1.146H1.175C.526 16 0 15.487 0 14.854V1.146zm4.943 12.248V6.169H2.542v7.225h2.401zm-1.2-8.212c.837 0 1.358-.554 1.358-1.248-.015-.709-.52-1.248-1.342-1.248-.822 0-1.359.54-1.359 1.248 0 .694.521 1.248 1.327 1.248h.016zm4.908 8.212V9.359c0-.216.016-.432.08-.586.173-.431.568-.878 1.232-.878.869 0 1.216.662 1.216 1.634v3.865h2.401V9.25c0-2.22-1.184-3.252-2.764-3.252-1.274 0-1.845.7-2.165 1.193v.025h-.016a5.54 5.54 0 0 1 .016-.025V6.169h-2.4c.03.678 0 7.225 0 7.225h2.4z"/>
-                    </svg>          
-                </a>
-                &nbsp;
-                <a href="https://github.com/shaadclt">
-                    <svg xmlns="http://www.w3.org/2000/svg" width="23" height="23" fill="white" class="bi bi-github" viewBox="0 0 16 16">
-                        <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/>
-                    </svg>
-                </a>
-            </p>
-        </div>
-    </footer>
-"""
-    st.markdown(footer, unsafe_allow_html=True)
-    
-    
-    # Set background image using HTML and CSS
-    st.markdown(
-        f"""
-        <style>
-            body {{
-                background: url('{url}') no-repeat center center fixed;
-                background-size: cover;
-                opacity: {opacity};
-            }}
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
-
-# Set background image from URL
-set_bg_from_url("https://www.1access.com/wp-content/uploads/2019/10/GettyImages-1180389186.jpg", opacity=0.875)

@@ -1,5 +1,5 @@
 import streamlit as st
-import openai
+from openai import OpenAI
 from PyPDF2 import PdfReader
 import os
 import time
@@ -17,8 +17,8 @@ load_dotenv()
 
 # Configuration - Centralized settings
 class Config:
-    PROJECT_NAME = "AI PDF Assistant By Mo"
-    COMPANY_NAME = "Powered by AI By Mo"
+    PROJECT_NAME = "AI PDF Assistant"
+    COMPANY_NAME = "Powered by AI"
     PDF_FILE_PATH = "data/reforming-modernity.pdf"
     MAX_TOKENS = 1000
     TEMPERATURE = 0.3
@@ -29,7 +29,9 @@ class Config:
 # Initialize OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
+    client = OpenAI(api_key=OPENAI_API_KEY)
+else:
+    client = None
 
 # Page configuration with better metadata
 st.set_page_config(
@@ -387,6 +389,9 @@ I'm your AI assistant, ready to help you explore and understand your PDF documen
 
 What would you like to know about your document?"""
     
+    if not client:
+        return "🔑 **OpenAI client not initialized.** Please check your API key."
+    
     try:
         # Truncate content to fit within token limits
         content_excerpt = pdf_content[:Config.MAX_CONTENT_LENGTH]
@@ -407,7 +412,7 @@ INSTRUCTIONS:
 
 Remember: Only use information from the provided document content."""
 
-        response = openai.ChatCompletion.create(
+        response = client.chat.completions.create(
             model=Config.MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -419,15 +424,16 @@ Remember: Only use information from the provided document content."""
         
         return response.choices[0].message.content.strip()
         
-    except openai.error.RateLimitError:
-        return "⚠️ **Rate limit reached.** Please wait a moment before asking another question."
-    except openai.error.AuthenticationError:
-        return "🔑 **Authentication error.** Please check your OpenAI API key."
-    except openai.error.InvalidRequestError as e:
-        return f"❌ **Invalid request:** {str(e)}"
     except Exception as e:
-        logger.error(f"Error generating AI response: {e}")
-        return f"❌ **Error generating response:** {str(e)}"
+        if "rate_limit" in str(e).lower():
+            return "⚠️ **Rate limit reached.** Please wait a moment before asking another question."
+        elif "authentication" in str(e).lower() or "api_key" in str(e).lower():
+            return "🔑 **Authentication error.** Please check your OpenAI API key."
+        elif "invalid" in str(e).lower():
+            return f"❌ **Invalid request:** {str(e)}"
+        else:
+            logger.error(f"Error generating AI response: {e}")
+            return f"❌ **Error generating response:** {str(e)}"
 
 def render_sidebar() -> None:
     """Render enhanced sidebar with PDF information and controls"""

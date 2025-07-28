@@ -1,0 +1,2 @@
+Requirement already satisfied: mammoth in c:\python312\lib\site-packages (1.9.1)
+Requirement already satisfied: cobble<0.2,>=0.1.3 in c:\python312\lib\site-packages (from mammoth) (0.1.4)

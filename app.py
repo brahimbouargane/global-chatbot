@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 from typing import Optional, Tuple, Dict, Any, List
 import logging
 import glob
+import base64
+import io
 
 # Import our localization system
 from localization import language_manager, t, init_language_system, render_language_selector, get_rtl_css, get_language_specific_ai_prompt
@@ -25,12 +27,23 @@ class Config:
     PROJECT_NAME = "AI Multi-Document Assistant"
     COMPANY_NAME = "Powered by AI"
     DATA_FOLDER = "data"
+    AUDIO_FOLDER = "audio_responses"
     MAX_TOKENS = 1500
     TEMPERATURE = 0.3
     MODEL = "gpt-3.5-turbo"
+    TTS_MODEL = "tts-1"  # OpenAI TTS model
+    TTS_VOICE = "alloy"  # Default voice
     MAX_CONTENT_LENGTH = 15000  # Increased for multiple docs
     PREVIEW_LENGTH = 800
     SUPPORTED_EXTENSIONS = ['.pdf', '.docx']
+    SUPPORTED_VOICES = {
+        'alloy': 'Alloy (Neutral)',
+        'echo': 'Echo (Male)', 
+        'fable': 'Fable (British Male)',
+        'onyx': 'Onyx (Deep Male)',
+        'nova': 'Nova (Female)',
+        'shimmer': 'Shimmer (Soft Female)'
+    }
 
 # Initialize OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -48,12 +61,156 @@ st.set_page_config(
     menu_items={
         'Get Help': None,
         'Report a bug': None,
-        'About': f"# {Config.PROJECT_NAME}\nChat with multiple documents using AI"
+        'About': f"# {Config.PROJECT_NAME}\nChat with multiple documents using AI with audio responses"
     }
 )
 
+def create_audio_folder():
+    """Create audio folder if it doesn't exist"""
+    audio_path = Path(Config.AUDIO_FOLDER)
+    audio_path.mkdir(exist_ok=True)
+    return audio_path
+
+def generate_audio_response(text: str, voice: str = None) -> Optional[bytes]:
+    """
+    Generate audio response using OpenAI TTS
+    
+    Args:
+        text: Text to convert to speech
+        voice: Voice to use (defaults to Config.TTS_VOICE)
+    
+    Returns:
+        Audio bytes or None if failed
+    """
+    if not client:
+        logger.error("OpenAI client not initialized")
+        return None
+    
+    if not text or not text.strip():
+        logger.error("No text provided for audio generation")
+        return None
+    
+    # Clean text for TTS (remove markdown and excessive formatting)
+    clean_text = clean_text_for_tts(text)
+    
+    # Use provided voice or default
+    selected_voice = voice or st.session_state.get('selected_voice', Config.TTS_VOICE)
+    
+    try:
+        # Generate audio using OpenAI TTS
+        response = client.audio.speech.create(
+            model=Config.TTS_MODEL,
+            voice=selected_voice,
+            input=clean_text,
+            response_format="mp3"
+        )
+        
+        # Return audio bytes
+        return response.content
+        
+    except Exception as e:
+        logger.error(f"Error generating audio: {e}")
+        return None
+
+def clean_text_for_tts(text: str) -> str:
+    """
+    Clean text for text-to-speech by removing markdown and formatting
+    
+    Args:
+        text: Raw text with potential markdown
+        
+    Returns:
+        Cleaned text suitable for TTS
+    """
+    if not text:
+        return ""
+    
+    # Remove markdown formatting
+    import re
+    
+    # Remove bold/italic markers
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)  # **bold**
+    text = re.sub(r'\*(.*?)\*', r'\1', text)      # *italic*
+    text = re.sub(r'_(.*?)_', r'\1', text)        # _italic_
+    
+    # Remove headers
+    text = re.sub(r'^#+\s*', '', text, flags=re.MULTILINE)
+    
+    # Remove code blocks
+    text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    
+    # Remove links but keep text
+    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
+    
+    # Remove special characters and emojis for better TTS
+    text = re.sub(r'[🔑📄📚⚠️❌✅🤖🙋📊💾⏱️🔧🗑️🔄🔍🚨📁]', '', text)
+    
+    # Clean up multiple spaces and line breaks
+    text = re.sub(r'\n+', '. ', text)
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Ensure proper sentence ending
+    text = text.strip()
+    if text and not text.endswith(('.', '!', '?')):
+        text += '.'
+    
+    return text
+
+def create_audio_player(audio_bytes: bytes, key: str = None) -> str:
+    """
+    Create an HTML audio player with the audio data
+    
+    Args:
+        audio_bytes: Audio data in bytes
+        key: Unique key for the audio player
+        
+    Returns:
+        HTML string for the audio player
+    """
+    if not audio_bytes:
+        return ""
+    
+    # Encode audio as base64
+    audio_base64 = base64.b64encode(audio_bytes).decode()
+    
+    # Create unique key if not provided
+    if not key:
+        key = f"audio_{int(time.time() * 1000)}"
+    
+    # HTML audio player with custom styling
+    audio_html = f"""
+    <div class="audio-player-container" style="margin: 10px 0;">
+        <div class="audio-controls" style="
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 25px;
+            padding: 10px 20px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+        ">
+            <div style="color: white; font-weight: 500; display: flex; align-items: center; gap: 8px;">
+                🔊 <span style="font-size: 14px;">{t('audio_response', default='Audio Response')}</span>
+            </div>
+            <audio controls style="
+                height: 35px;
+                border-radius: 17px;
+                outline: none;
+                flex: 1;
+                min-width: 200px;
+            ">
+                <source src="data:audio/mp3;base64,{audio_base64}" type="audio/mpeg">
+                {t('audio_not_supported', default='Your browser does not support audio playback.')}
+            </audio>
+        </div>
+    </div>
+    """
+    
+    return audio_html
+
 def get_enhanced_css() -> str:
-    """Get enhanced CSS with RTL support"""
+    """Get enhanced CSS with RTL support and audio player styling"""
     base_css = """
     <style>
         /* Import Google Fonts */
@@ -153,6 +310,51 @@ def get_enhanced_css() -> str:
             color: var(--text-primary);
             line-height: 1.6;
             font-size: 0.95rem;
+        }
+        
+        /* Audio player styling */
+        .audio-player-container {
+            margin: 15px 0;
+            padding: 0;
+        }
+        
+        .audio-controls {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 25px;
+            padding: 12px 20px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+            transition: all 0.3s ease;
+        }
+        
+        .audio-controls:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(0,0,0,0.3);
+        }
+        
+        .audio-controls audio {
+            height: 35px;
+            border-radius: 17px;
+            outline: none;
+            flex: 1;
+            min-width: 200px;
+            background: rgba(255,255,255,0.2);
+        }
+        
+        .audio-controls audio::-webkit-media-controls-panel {
+            background: rgba(255,255,255,0.1);
+            border-radius: 17px;
+        }
+        
+        /* Voice selector styling */
+        .voice-selector {
+            background: var(--background-light);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 1rem;
         }
         
         /* Language selector styling */
@@ -339,6 +541,32 @@ def get_enhanced_css() -> str:
             box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
         }
         
+        /* Accessibility features */
+        .audio-toggle {
+            background: linear-gradient(135deg, #10b981, #059669);
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            border: none;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        
+        .audio-toggle:hover {
+            transform: translateY(-1px);
+            box-shadow: var(--shadow);
+        }
+        
+        .audio-toggle.disabled {
+            background: linear-gradient(135deg, #6b7280, #4b5563);
+            cursor: not-allowed;
+        }
+        
         /* Responsive design */
         @media (max-width: 768px) {
             .main-header h1 {
@@ -363,6 +591,16 @@ def get_enhanced_css() -> str:
                 flex-direction: column;
                 gap: 0.25rem;
             }
+            
+            .audio-controls {
+                flex-direction: column;
+                gap: 10px;
+            }
+            
+            .audio-controls audio {
+                min-width: unset;
+                width: 100%;
+            }
         }
     </style>
     """
@@ -382,6 +620,12 @@ def initialize_session_state() -> None:
         st.session_state.documents_loaded = False
     if 'total_metadata' not in st.session_state:
         st.session_state.total_metadata = {}
+    if 'audio_enabled' not in st.session_state:
+        st.session_state.audio_enabled = True  # Enable audio by default
+    if 'selected_voice' not in st.session_state:
+        st.session_state.selected_voice = Config.TTS_VOICE
+    if 'audio_responses' not in st.session_state:
+        st.session_state.audio_responses = {}  # Store audio data for messages
     
     # Initialize language system
     init_language_system()
@@ -804,12 +1048,69 @@ def search_documents(question: str, documents: Dict[str, Dict]) -> str:
             logger.error(f"Error generating AI response: {e}")
             return f"❌ **{t('response_error', error=str(e))}**"
 
+def render_voice_selector():
+    """Render voice selector in sidebar"""
+    st.markdown(f"### 🎤 {t('voice_settings', default='Voice Settings')}")
+    
+    # Audio toggle
+    current_audio_state = st.session_state.get('audio_enabled', True)
+    audio_enabled = st.checkbox(
+        f"🔊 {t('enable_audio', default='Enable Audio Responses')}", 
+        value=current_audio_state,
+        help=t('audio_help', default='Toggle audio responses for accessibility')
+    )
+    st.session_state.audio_enabled = audio_enabled
+    
+    if audio_enabled:
+        # Voice selection
+        voice_options = list(Config.SUPPORTED_VOICES.keys())
+        voice_labels = [Config.SUPPORTED_VOICES[voice] for voice in voice_options]
+        
+        current_voice = st.session_state.get('selected_voice', Config.TTS_VOICE)
+        
+        # Find current voice index
+        try:
+            current_index = voice_options.index(current_voice)
+        except ValueError:
+            current_index = 0
+        
+        selected_voice = st.selectbox(
+            f"🎭 {t('select_voice', default='Select Voice')}", 
+            options=voice_options,
+            format_func=lambda x: Config.SUPPORTED_VOICES[x],
+            index=current_index,
+            help=t('voice_help', default='Choose the voice for audio responses')
+        )
+        
+        st.session_state.selected_voice = selected_voice
+        
+        # Test voice button
+        if st.button(f"🎵 {t('test_voice', default='Test Voice')}", type="secondary"):
+            test_text = t('test_audio_text', default='Hello! This is how I will sound when reading responses to you.')
+            
+            with st.spinner(t('generating_audio', default='Generating audio...')):
+                audio_bytes = generate_audio_response(test_text, selected_voice)
+                
+            if audio_bytes:
+                audio_html = create_audio_player(audio_bytes, key="voice_test")
+                st.markdown(audio_html, unsafe_allow_html=True)
+                st.success(t('audio_ready', default='Audio ready!'))
+            else:
+                st.error(t('audio_error', default='Failed to generate audio'))
+    else:
+        st.info(t('audio_disabled', default='Audio responses are disabled'))
+
 def render_sidebar() -> None:
-    """Render enhanced sidebar with multi-document information and language selector"""
+    """Render enhanced sidebar with multi-document information, language selector, and voice settings"""
     with st.sidebar:
         # Language selector at the top
         st.markdown(f"### 🌐 {t('language_selector')}")
         render_language_selector()
+        
+        st.markdown("---")
+        
+        # Voice settings
+        render_voice_selector()
         
         st.markdown("---")
         
@@ -894,6 +1195,7 @@ def render_sidebar() -> None:
         # Clear chat button
         if st.button(f"🗑️ {t('clear_chat')}", type="secondary", use_container_width=True):
             st.session_state.messages = []
+            st.session_state.audio_responses = {}  # Clear audio responses too
             st.rerun()
         
         # Reload documents button
@@ -905,11 +1207,11 @@ def render_sidebar() -> None:
             st.rerun()
 
 def render_chat_interface() -> None:
-    """Render the main chat interface with multi-language support"""
+    """Render the main chat interface with audio support and multi-language support"""
     st.markdown(f"""
     <div class="main-header">
         <h1>📚 {t('app_title')}</h1>
-        <p>{t('app_subtitle')} • {t('powered_by')}</p>
+        <p>{t('app_subtitle')} • {t('powered_by')} • 🔊 {t('audio_enabled_label', default='Audio Enabled')}</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -946,11 +1248,17 @@ def render_chat_interface() -> None:
                     <li>"{t('example_3')}"</li>
                     <li>"{t('example_4')}"</li>
                 </ul>
+                <div style="margin-top: 20px; padding: 15px; background: linear-gradient(135deg, #10b981, #059669); color: white; border-radius: 10px;">
+                    <h4 style="margin: 0 0 10px 0;">🔊 {t('accessibility_note', default='Accessibility Feature')}</h4>
+                    <p style="margin: 0; opacity: 0.9;">{t('audio_description', default='This app includes audio responses to help users who cannot read or prefer audio output. Enable audio in the sidebar and choose your preferred voice.')}</p>
+                </div>
             </div>
             """, unsafe_allow_html=True)
         else:
-            # Display chat messages
+            # Display chat messages with audio
             for i, message in enumerate(st.session_state.messages):
+                message_key = f"msg_{i}_{message.get('timestamp', time.time())}"
+                
                 if message["role"] == "user":
                     st.markdown(f"""
                     <div class="chat-message user-message">
@@ -961,6 +1269,7 @@ def render_chat_interface() -> None:
                     </div>
                     """, unsafe_allow_html=True)
                 else:
+                    # AI response with audio
                     st.markdown(f"""
                     <div class="chat-message assistant-message">
                         <div class="message-header">
@@ -969,9 +1278,30 @@ def render_chat_interface() -> None:
                         <div class="message-content">{message["content"]}</div>
                     </div>
                     """, unsafe_allow_html=True)
+                    
+                    # Add audio player if audio is enabled
+                    if st.session_state.get('audio_enabled', True):
+                        # Check if we already have audio for this message
+                        if message_key not in st.session_state.audio_responses:
+                            # Generate audio for this message
+                            with st.spinner(t('generating_audio', default='Generating audio...')):
+                                audio_bytes = generate_audio_response(
+                                    message["content"], 
+                                    st.session_state.get('selected_voice', Config.TTS_VOICE)
+                                )
+                                if audio_bytes:
+                                    st.session_state.audio_responses[message_key] = audio_bytes
+                        
+                        # Display audio player if we have audio
+                        if message_key in st.session_state.audio_responses:
+                            audio_html = create_audio_player(
+                                st.session_state.audio_responses[message_key], 
+                                key=message_key
+                            )
+                            st.markdown(audio_html, unsafe_allow_html=True)
 
 def handle_user_input() -> None:
-    """Handle user input and generate AI responses with multi-language support"""
+    """Handle user input and generate AI responses with audio support and multi-language support"""
     # Chat input with localized placeholder
     if prompt := st.chat_input(t('search_placeholder')):
         # Validate input
@@ -991,31 +1321,49 @@ def handle_user_input() -> None:
             response = search_documents(prompt, st.session_state.documents)
         
         # Add AI response
-        st.session_state.messages.append({
+        ai_message = {
             "role": "assistant", 
             "content": response,
             "timestamp": time.time()
-        })
+        }
+        st.session_state.messages.append(ai_message)
+        
+        # Pre-generate audio if enabled (for better UX)
+        if st.session_state.get('audio_enabled', True) and response:
+            message_key = f"msg_{len(st.session_state.messages)-1}_{ai_message['timestamp']}"
+            try:
+                with st.spinner(t('preparing_audio', default='Preparing audio...')):
+                    audio_bytes = generate_audio_response(
+                        response, 
+                        st.session_state.get('selected_voice', Config.TTS_VOICE)
+                    )
+                    if audio_bytes:
+                        st.session_state.audio_responses[message_key] = audio_bytes
+            except Exception as e:
+                logger.error(f"Error pre-generating audio: {e}")
         
         # Rerun to update the interface
         st.rerun()
 
 def main() -> None:
-    """Main application function with proper error handling and multi-language support"""
+    """Main application function with proper error handling, audio support, and multi-language support"""
     try:
         # Initialize session state and language system
         initialize_session_state()
         
-        # Apply enhanced CSS with RTL support
+        # Create audio folder
+        create_audio_folder()
+        
+        # Apply enhanced CSS with RTL support and audio styling
         st.markdown(get_enhanced_css(), unsafe_allow_html=True)
         
-        # Render sidebar
+        # Render sidebar with voice settings
         render_sidebar()
         
-        # Render main chat interface
+        # Render main chat interface with audio support
         render_chat_interface()
         
-        # Handle user input
+        # Handle user input with audio generation
         handle_user_input()
         
     except Exception as e:

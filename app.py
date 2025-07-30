@@ -278,11 +278,11 @@ def get_enhanced_css() -> str:
         
         /* Header styling */
         .main-header {
-            background: linear-gradient(135deg, var(--secondary-color), var(--info-color));
+            background: linear-gradient(135deg, var(--background-light), var(--background-light));
             padding: 2rem;
             border-radius: 12px;
             margin-bottom: 2rem;
-            color: white;
+            color: black;
             text-align: center;
             box-shadow: var(--shadow-lg);
         }

@@ -24,10 +24,12 @@ load_dotenv()
 
 # Configuration - Centralized settings
 class Config:
-    PROJECT_NAME = "AI Multi-Document Assistant"
-    COMPANY_NAME = "Powered by AI"
+    PROJECT_NAME = "Roehampton University Chatbot"
+    COMPANY_NAME = "University of Roehampton"
     DATA_FOLDER = "data"
     AUDIO_FOLDER = "audio_responses"
+    TEMP_AUDIO_FOLDER = "temp_audio"
+    LOGO_PATH = "logo.png"
     MAX_TOKENS = 1500
     TEMPERATURE = 0.3
     MODEL = "gpt-3.5-turbo"
@@ -55,13 +57,13 @@ else:
 # Page configuration with better metadata
 st.set_page_config(
     page_title=Config.PROJECT_NAME,
-    page_icon="📚",
+    page_icon="🎓",  # Changed from 📚 to graduation cap
     layout="wide",
     initial_sidebar_state="expanded",
     menu_items={
         'Get Help': None,
         'Report a bug': None,
-        'About': f"# {Config.PROJECT_NAME}\nChat with multiple documents using AI with audio responses"
+        'About': f"# {Config.PROJECT_NAME}\nIntelligent document assistant for University of Roehampton with audio responses"
     }
 )
 
@@ -70,6 +72,35 @@ def create_audio_folder():
     audio_path = Path(Config.AUDIO_FOLDER)
     audio_path.mkdir(exist_ok=True)
     return audio_path
+
+
+def load_logo() -> Optional[str]:
+    """Load and encode logo image as base64"""
+    logo_path = Path(Config.LOGO_PATH)
+    
+    # Try multiple possible logo locations
+    possible_paths = [
+        logo_path,
+        Path("assets") / "logo.png",
+        Path("images") / "logo.png",
+        Path("static") / "logo.png"
+    ]
+    
+    for path in possible_paths:
+        if path.exists():
+            try:
+                with open(path, "rb") as img_file:
+                    img_bytes = img_file.read()
+                    img_base64 = base64.b64encode(img_bytes).decode()
+                    return img_base64
+            except Exception as e:
+                logger.warning(f"Error loading logo from {path}: {e}")
+                continue
+    
+    # If no logo found, return None (will use text-based header)
+    logger.info("No logo found, using text-based header")
+    return None
+
 
 def generate_audio_response(text: str, voice: str = None) -> Optional[bytes]:
     """
@@ -144,8 +175,7 @@ def clean_text_for_tts(text: str) -> str:
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
     
     # Remove special characters and emojis for better TTS
-    text = re.sub(r'[🔑📄📚⚠️❌✅🤖🙋📊💾⏱️🔧🗑️🔄🔍🚨📁]', '', text)
-    
+    text = re.sub(r'[🔑📄📚⚠️❌✅🤖🙋📊💾⏱️🔧🗑️🔄🔍🚨📁🎓]', '', text)    
     # Clean up multiple spaces and line breaks
     text = re.sub(r'\n+', '. ', text)
     text = re.sub(r'\s+', ' ', text)
@@ -182,13 +212,13 @@ def create_audio_player(audio_bytes: bytes, key: str = None) -> str:
     audio_html = f"""
     <div class="audio-player-container" style="margin: 10px 0;">
         <div class="audio-controls" style="
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #8B1538 0%, #B91E47 100%);
             border-radius: 25px;
             padding: 10px 20px;
             display: flex;
             align-items: center;
             gap: 15px;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+            box-shadow: 0 4px 15px rgba(139,21,56,0.3);
         ">
             <div style="color: white; font-weight: 500; display: flex; align-items: center; gap: 8px;">
                 🔊 <span style="font-size: 14px;">{t('audio_response', default='Audio Response')}</span>
@@ -1207,13 +1237,37 @@ def render_sidebar() -> None:
             st.rerun()
 
 def render_chat_interface() -> None:
-    """Render the main chat interface with audio support and multi-language support"""
-    st.markdown(f"""
-    <div class="main-header">
-        <h1>📚 {t('app_title')}</h1>
-        <p>{t('app_subtitle')} • {t('powered_by')} • 🔊 {t('audio_enabled_label', default='Audio Enabled')}</p>
-    </div>
-    """, unsafe_allow_html=True)
+    """Render the main chat interface with audio support and voice input"""
+    
+    # Load logo
+    logo_base64 = load_logo()
+    
+    # Create header with or without logo
+    if logo_base64:
+        header_html = f"""
+        <div class="main-header">
+            <div class="header-content">
+                <div class="logo-container">
+                    <img src="data:image/png;base64,{logo_base64}" alt="University of Roehampton Logo" class="logo">
+                    <div>
+                        <h1>🎓 {t('app_title', default='Roehampton University Chatbot')}</h1>
+                    </div>
+                </div>
+                <p>{t('app_subtitle', default='Intelligent document assistant for University of Roehampton')} • {t('powered_by', default='Powered by AI')} • 🔊 {t('audio_enabled_label', default='Audio Enabled')} • 🎤 {t('voice_input_label', default='Voice Input Available')}</p>
+            </div>
+        </div>
+        """
+    else:
+        header_html = f"""
+        <div class="main-header">
+            <div class="header-content">
+                <h1>🎓 {t('app_title', default='Roehampton University Chatbot')}</h1>
+                <p>{t('app_subtitle', default='Intelligent document assistant for University of Roehampton')} • {t('powered_by', default='Powered by AI')} • 🔊 {t('audio_enabled_label', default='Audio Enabled')} • 🎤 {t('voice_input_label', default='Voice Input Available')}</p>
+            </div>
+        </div>
+        """
+    
+    st.markdown(header_html, unsafe_allow_html=True)
     
     # Check prerequisites
     if not OPENAI_API_KEY:

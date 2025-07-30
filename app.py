@@ -212,7 +212,7 @@ def create_audio_player(audio_bytes: bytes, key: str = None) -> str:
     audio_html = f"""
     <div class="audio-player-container" style="margin: 10px 0;">
         <div class="audio-controls" style="
-            background: linear-gradient(135deg, #8B1538 0%, #B91E47 100%);
+            background: linear-gradient(135deg, #10b981 0%, #10b981 100%);
             border-radius: 25px;
             padding: 10px 20px;
             display: flex;

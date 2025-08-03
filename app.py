@@ -2,15 +2,22 @@ import streamlit as st
 from openai import OpenAI
 from PyPDF2 import PdfReader
 from docx import Document
+import pandas as pd
 import os
 import time
+import re
 from pathlib import Path
 from dotenv import load_dotenv
 from typing import Optional, Tuple, Dict, Any, List
 import logging
-import glob
 import base64
 import io
+
+try:
+    from ethics_handler import render_ethics_chat_interface, initialize_ethics_session_state
+    ETHICS_AVAILABLE = True
+except ImportError as e:
+    ETHICS_AVAILABLE = False
 
 # Import our localization system
 from localization import language_manager, t, init_language_system, render_language_selector, get_rtl_css, get_language_specific_ai_prompt
@@ -22,7 +29,7 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
-# Configuration - Centralized settings
+# Configuration - Updated for guided flow
 class Config:
     PROJECT_NAME = "Roehampton University Chatbot"
     COMPANY_NAME = "University of Roehampton"
@@ -30,12 +37,14 @@ class Config:
     AUDIO_FOLDER = "audio_responses"
     TEMP_AUDIO_FOLDER = "temp_audio"
     LOGO_PATH = "logo.png"
+    STUDENT_DATA_FILE = "student_modules_with_pdfs.xlsx"  # Excel file with student data
+    ETHICS_FOLDER = "ethics_documents"  # Folder for ethics documents
     MAX_TOKENS = 1500
     TEMPERATURE = 0.3
     MODEL = "gpt-3.5-turbo"
-    TTS_MODEL = "tts-1"  # OpenAI TTS model
-    TTS_VOICE = "alloy"  # Default voice
-    MAX_CONTENT_LENGTH = 15000  # Increased for multiple docs
+    TTS_MODEL = "tts-1"
+    TTS_VOICE = "alloy"
+    MAX_CONTENT_LENGTH = 15000
     PREVIEW_LENGTH = 800
     SUPPORTED_EXTENSIONS = ['.pdf', '.docx']
     SUPPORTED_VOICES = {
@@ -54,53 +63,200 @@ if OPENAI_API_KEY:
 else:
     client = None
 
-# Page configuration with better metadata
+
+def load_logo_from_assets() -> Optional[str]:
+    """Load logo from assets folder and encode as base64"""
+    # Try multiple possible logo locations in assets folder
+    possible_paths = [
+        Path("assets") / "logo.png",
+        Path("assets") / "logo.jpg", 
+        Path("assets") / "logo.jpeg",
+        Path("assets") / "logo.svg",
+        Path("assets") / "roehampton_logo.png",
+        Path("assets") / "university_logo.png"
+    ]
+    
+    for logo_path in possible_paths:
+        if logo_path.exists():
+            try:
+                with open(logo_path, "rb") as img_file:
+                    img_bytes = img_file.read()
+                    img_base64 = base64.b64encode(img_bytes).decode()
+                    logger.info(f"Successfully loaded logo from: {logo_path}")
+                    return img_base64
+            except Exception as e:
+                logger.warning(f"Error loading logo from {logo_path}: {e}")
+                continue
+    
+    logger.info("No logo found in assets folder")
+    return None 
+
+# Page configuration
 st.set_page_config(
     page_title=Config.PROJECT_NAME,
-    page_icon="🎓",  # Changed from 📚 to graduation cap
+    page_icon= "🎓",
     layout="wide",
     initial_sidebar_state="expanded",
     menu_items={
         'Get Help': None,
         'Report a bug': None,
-        'About': f"# {Config.PROJECT_NAME}\nIntelligent document assistant for University of Roehampton with audio responses"
+        'About': f"# {Config.PROJECT_NAME}\nGuided coursework assistant for University of Roehampton students"
     }
 )
 
-def create_audio_folder():
-    """Create audio folder if it doesn't exist"""
-    audio_path = Path(Config.AUDIO_FOLDER)
-    audio_path.mkdir(exist_ok=True)
-    return audio_path
-
-
-def load_logo() -> Optional[str]:
-    """Load and encode logo image as base64"""
-    logo_path = Path(Config.LOGO_PATH)
+def initialize_session_state() -> None:
+    """Initialize session state for guided conversation flow"""
+    # Conversation flow states
+    if 'conversation_step' not in st.session_state:
+        st.session_state.conversation_step = 'welcome'  # welcome -> path_selection -> student_id -> code -> module -> coursework -> chat
     
-    # Try multiple possible logo locations
-    possible_paths = [
-        logo_path,
-        Path("assets") / "logo.png",
-        Path("images") / "logo.png",
-        Path("static") / "logo.png"
-    ]
+    # Authentication data
+    if 'student_id' not in st.session_state:
+        st.session_state.student_id = None
+    if 'student_code' not in st.session_state:
+        st.session_state.student_code = None
+    if 'student_data' not in st.session_state:
+        st.session_state.student_data = None
+    if 'selected_path' not in st.session_state:
+        st.session_state.selected_path = None  # 'ethics' or 'coursework'
     
-    for path in possible_paths:
-        if path.exists():
-            try:
-                with open(path, "rb") as img_file:
-                    img_bytes = img_file.read()
-                    img_base64 = base64.b64encode(img_bytes).decode()
-                    return img_base64
-            except Exception as e:
-                logger.warning(f"Error loading logo from {path}: {e}")
-                continue
+    # Module and coursework selection
+    if 'available_modules' not in st.session_state:
+        st.session_state.available_modules = []
+    if 'selected_module' not in st.session_state:
+        st.session_state.selected_module = None
+    if 'selected_coursework' not in st.session_state:
+        st.session_state.selected_coursework = None
+    if 'current_document' not in st.session_state:
+        st.session_state.current_document = None
     
-    # If no logo found, return None (will use text-based header)
-    logger.info("No logo found, using text-based header")
-    return None
+    # Chat data
+    if 'messages' not in st.session_state:
+        st.session_state.messages = []
+    if 'audio_enabled' not in st.session_state:
+        st.session_state.audio_enabled = True
+    if 'selected_voice' not in st.session_state:
+        st.session_state.selected_voice = Config.TTS_VOICE
+    if 'audio_responses' not in st.session_state:
+        st.session_state.audio_responses = {}
+    
+    # Error handling
+    if 'error_message' not in st.session_state:
+        st.session_state.error_message = None
+    if 'retry_count' not in st.session_state:
+        st.session_state.retry_count = 0
+    
+    # Student database
+    if 'student_database' not in st.session_state:
+        st.session_state.student_database = None
+    if 'database_loaded' not in st.session_state:
+        st.session_state.database_loaded = False
 
+      # Add ethics-specific initialization
+    if 'selected_ethics_category' not in st.session_state:
+        st.session_state.selected_ethics_category = None
+    if 'ethics_document' not in st.session_state:
+        st.session_state.ethics_document = None
+    
+    # Initialize ethics session state if available
+    if ETHICS_AVAILABLE:
+        initialize_ethics_session_state()
+    
+    # Initialize language system
+    init_language_system()
+
+@st.cache_data(show_spinner=False)
+def load_student_database() -> Tuple[Optional[Dict], str]:
+    """Load student database from Excel file"""
+    try:
+        excel_path = Path(Config.STUDENT_DATA_FILE)
+        if not excel_path.exists():
+            return None, f"Student database file not found: {Config.STUDENT_DATA_FILE}"
+        
+        # Read Excel file
+        df = pd.read_excel(excel_path)
+        
+        # Validate required columns
+        required_columns = ['Student ID', 'Code', 'Programme', 'Module', 'PDF File']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            return None, f"Missing required columns in Excel file: {missing_columns}"
+        
+        # Create data structures
+        student_database = {
+            'students': {},  # student_id -> {code, programme, modules}
+            'student_codes': {},  # student_id -> code
+            'student_modules': {},  # student_id -> [modules]
+            'programme_modules': {}  # programme -> [modules]
+        }
+        
+        for _, row in df.iterrows():
+            student_id = str(row['Student ID'])
+            code = int(row['Code'])
+            programme = row['Programme']
+            module = row['Module']
+            pdf_file = row['PDF File']
+            
+            # Initialize student if not exists
+            if student_id not in student_database['students']:
+                student_database['students'][student_id] = {
+                    'code': code,
+                    'programme': programme,
+                    'modules': []
+                }
+                student_database['student_codes'][student_id] = code
+                student_database['student_modules'][student_id] = []
+            
+            # Add module
+            module_data = {
+                'module': module,
+                'programme': programme,
+                'pdf_file': pdf_file
+            }
+            student_database['student_modules'][student_id].append(module_data)
+            student_database['students'][student_id]['modules'].append(module_data)
+            
+            # Add to programme modules
+            if programme not in student_database['programme_modules']:
+                student_database['programme_modules'][programme] = []
+            
+            if not any(m['module'] == module for m in student_database['programme_modules'][programme]):
+                student_database['programme_modules'][programme].append({
+                    'module': module,
+                    'pdf_file': pdf_file
+                })
+        
+        logger.info(f"Loaded {len(student_database['students'])} students from database")
+        return student_database, "Database loaded successfully"
+        
+    except Exception as e:
+        logger.error(f"Error loading student database: {e}")
+        return None, f"Error loading database: {str(e)}"
+
+def validate_student_credentials(student_id: str, code: str) -> Tuple[bool, Optional[Dict], str]:
+    """Validate student ID and code"""
+    if not st.session_state.student_database:
+        return False, None, "Student database not loaded"
+    
+    student_id = student_id.strip().upper()
+    
+    try:
+        code = int(code.strip())
+    except ValueError:
+        return False, None, "Code must be a number"
+    
+    # Check if student exists
+    if student_id not in st.session_state.student_database['students']:
+        return False, None, f"Student ID '{student_id}' not found in database"
+    
+    # Check if code matches
+    stored_code = st.session_state.student_database['student_codes'][student_id]
+    if code != stored_code:
+        return False, None, f"Invalid code for student {student_id}"
+    
+    # Return student data
+    student_data = st.session_state.student_database['students'][student_id]
+    return True, student_data, "Authentication successful"
 
 def generate_audio_response(text: str, voice: str = None) -> Optional[bytes]:
     """
@@ -157,8 +313,6 @@ def clean_text_for_tts(text: str) -> str:
         return ""
     
     # Remove markdown formatting
-    import re
-    
     # Remove bold/italic markers
     text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)  # **bold**
     text = re.sub(r'\*(.*?)\*', r'\1', text)      # *italic*
@@ -175,7 +329,7 @@ def clean_text_for_tts(text: str) -> str:
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
     
     # Remove special characters and emojis for better TTS
-    text = re.sub(r'[🔑📄📚⚠️❌✅🤖🙋📊💾⏱️🔧🗑️🔄🔍🚨📁🎓]', '', text)    
+    text = re.sub(r'[🔑📄📚⚠️❌✅🤖🙋📊💾⏱️🔧🗑️🔄🔍🚨📁🎓📋🆔🔐]', '', text)    
     # Clean up multiple spaces and line breaks
     text = re.sub(r'\n+', '. ', text)
     text = re.sub(r'\s+', ' ', text)
@@ -212,13 +366,13 @@ def create_audio_player(audio_bytes: bytes, key: str = None) -> str:
     audio_html = f"""
     <div class="audio-player-container" style="margin: 10px 0;">
         <div class="audio-controls" style="
-            background: linear-gradient(135deg, #10b981 0%, #10b981 100%);
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             border-radius: 25px;
             padding: 10px 20px;
             display: flex;
             align-items: center;
             gap: 15px;
-            box-shadow: 0 4px 15px rgba(139,21,56,0.3);
+            box-shadow: 0 4px 15px rgba(102,126,234,0.3);
         ">
             <div style="color: white; font-weight: 500; display: flex; align-items: center; gap: 8px;">
                 🔊 <span style="font-size: 14px;">{t('audio_response', default='Audio Response')}</span>
@@ -239,844 +393,11 @@ def create_audio_player(audio_bytes: bytes, key: str = None) -> str:
     
     return audio_html
 
-def get_enhanced_css() -> str:
-    """Get enhanced CSS with RTL support and audio player styling"""
-    base_css = """
-    <style>
-        /* Import Google Fonts */
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Arabic:wght@300;400;500;600;700&display=swap');
-        
-        /* Root variables for consistent theming */
-        :root {
-            --primary-color: #1f2937;
-            --secondary-color: #3b82f6;
-            --success-color: #10b981;
-            --error-color: #ef4444;
-            --warning-color: #f59e0b;
-            --info-color: #8b5cf6;
-            --background-light: #f8fafc;
-            --background-dark: #ffffff;
-            --text-primary: #111827;
-            --text-secondary: #6b7280;
-            --border-color: #e5e7eb;
-            --shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.06);
-            --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
-        }
-        
-        /* Global font with multi-language support */
-        .main, .sidebar .sidebar-content {
-            font-family: 'Inter', 'Noto Sans Arabic', 'Arial', sans-serif !important;
-        }
-        
-        /* Arabic text specific styling */
-        [lang="ar"], .arabic-text {
-            font-family: 'Noto Sans Arabic', 'Arial', 'Tahoma', sans-serif !important;
-            line-height: 1.8 !important;
-            text-align: right !important;
-        }
-        
-        /* Header styling */
-        .main-header {
-            background: linear-gradient(135deg, var(--background-light), var(--background-light));
-            padding: 2rem;
-            border-radius: 12px;
-            margin-bottom: 2rem;
-            color: black;
-            text-align: center;
-            box-shadow: var(--shadow-lg);
-        }
-        
-        .main-header h1 {
-            margin: 0 0 0.5rem 0;
-            font-weight: 700;
-            font-size: 2.5rem;
-        }
-        
-        .main-header p {
-            margin: 0;
-            opacity: 0.9;
-            font-size: 1.1rem;
-        }
-        
-        /* Chat message containers */
-        .chat-message {
-            padding: 1.5rem;
-            border-radius: 12px;
-            margin-bottom: 1.5rem;
-            box-shadow: var(--shadow);
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
-            border: 1px solid var(--border-color);
-        }
-        
-        .chat-message:hover {
-            transform: translateY(-2px);
-            box-shadow: var(--shadow-lg);
-        }
-        
-        .user-message {
-            background: linear-gradient(135deg, #dbeafe, #bfdbfe);
-            border-left: 4px solid var(--secondary-color);
-            margin-left: 2rem;
-        }
-        
-        .assistant-message {
-            background: linear-gradient(135deg, #f0fdf4, #dcfce7);
-            border-left: 4px solid var(--success-color);
-            margin-right: 2rem;
-        }
-        
-        .message-header {
-            font-weight: 600;
-            margin-bottom: 0.75rem;
-            color: var(--text-primary);
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            font-size: 0.95rem;
-        }
-        
-        .message-content {
-            color: var(--text-primary);
-            line-height: 1.6;
-            font-size: 0.95rem;
-        }
-        
-        /* Audio player styling */
-        .audio-player-container {
-            margin: 15px 0;
-            padding: 0;
-        }
-        
-        .audio-controls {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            border-radius: 25px;
-            padding: 12px 20px;
-            display: flex;
-            align-items: center;
-            gap: 15px;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
-            transition: all 0.3s ease;
-        }
-        
-        .audio-controls:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 20px rgba(0,0,0,0.3);
-        }
-        
-        .audio-controls audio {
-            height: 35px;
-            border-radius: 17px;
-            outline: none;
-            flex: 1;
-            min-width: 200px;
-            background: rgba(255,255,255,0.2);
-        }
-        
-        .audio-controls audio::-webkit-media-controls-panel {
-            background: rgba(255,255,255,0.1);
-            border-radius: 17px;
-        }
-        
-        /* Voice selector styling */
-        .voice-selector {
-            background: var(--background-light);
-            border: 1px solid var(--border-color);
-            border-radius: 8px;
-            padding: 1rem;
-            margin-bottom: 1rem;
-        }
-        
-        /* Language selector styling */
-        .language-selector {
-            margin-bottom: 1rem;
-            padding: 1rem;
-            background: var(--background-light);
-            border-radius: 8px;
-            border: 1px solid var(--border-color);
-        }
-        
-        /* Document source indicator */
-        .doc-source {
-            background: linear-gradient(135deg, var(--info-color), #7c3aed);
-            color: white;
-            padding: 0.25rem 0.75rem;
-            border-radius: 15px;
-            font-size: 0.8rem;
-            font-weight: 500;
-            margin: 0.5rem 0;
-            display: inline-block;
-        }
-        
-        /* Document library styling */
-        .doc-item {
-            background: var(--background-light);
-            border: 1px solid var(--border-color);
-            border-radius: 8px;
-            padding: 1rem;
-            margin-bottom: 0.75rem;
-            transition: all 0.2s ease;
-        }
-        
-        .doc-item:hover {
-            border-color: var(--secondary-color);
-            box-shadow: var(--shadow);
-        }
-        
-        .doc-name {
-            font-weight: 600;
-            color: var(--text-primary);
-            margin-bottom: 0.25rem;
-        }
-        
-        .doc-meta {
-            font-size: 0.85rem;
-            color: var(--text-secondary);
-            display: flex;
-            gap: 1rem;
-            flex-wrap: wrap;
-        }
-        
-        /* Sidebar styling */
-        .sidebar-info {
-            background: var(--background-light);
-            padding: 1.5rem;
-            border-radius: 12px;
-            border: 1px solid var(--border-color);
-            box-shadow: var(--shadow);
-            margin-bottom: 1rem;
-        }
-        
-        .info-item {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 0.5rem 0;
-            border-bottom: 1px solid var(--border-color);
-        }
-        
-        .info-item:last-child {
-            border-bottom: none;
-        }
-        
-        .info-label {
-            font-weight: 500;
-            color: var(--text-secondary);
-            font-size: 0.9rem;
-        }
-        
-        .info-value {
-            font-weight: 600;
-            color: var(--text-primary);
-            font-size: 0.9rem;
-        }
-        
-        /* Status indicators */
-        .status-success {
-            background: linear-gradient(135deg, #10b981, #059669);
-            color: white;
-            padding: 0.5rem 1rem;
-            border-radius: 20px;
-            font-size: 0.9rem;
-            font-weight: 500;
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-        
-        .status-error {
-            background: linear-gradient(135deg, #ef4444, #dc2626);
-            color: white;
-            padding: 0.5rem 1rem;
-            border-radius: 20px;
-            font-size: 0.9rem;
-            font-weight: 500;
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-        
-        .status-info {
-            background: linear-gradient(135deg, var(--info-color), #7c3aed);
-            color: white;
-            padding: 0.5rem 1rem;
-            border-radius: 20px;
-            font-size: 0.9rem;
-            font-weight: 500;
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-        
-        /* Loading animation */
-        .loading-dots {
-            display: inline-flex;
-            gap: 0.25rem;
-            align-items: center;
-        }
-        
-        .loading-dots::after {
-            content: '';
-            width: 6px;
-            height: 6px;
-            background: var(--secondary-color);
-            border-radius: 50%;
-            animation: loading 1.5s infinite;
-        }
-        
-        @keyframes loading {
-            0%, 20%, 100% { opacity: 0; }
-            50% { opacity: 1; }
-        }
-        
-        /* Empty state */
-        .empty-state {
-            text-align: center;
-            padding: 3rem 2rem;
-            color: var(--text-secondary);
-        }
-        
-        .empty-state-icon {
-            font-size: 4rem;
-            margin-bottom: 1rem;
-            opacity: 0.5;
-        }
-        
-        /* Button styling */
-        .stButton > button {
-            background: linear-gradient(135deg, var(--secondary-color), #1d4ed8);
-            color: white;
-            border: none;
-            border-radius: 8px;
-            padding: 0.75rem 1.5rem;
-            font-weight: 500;
-            transition: all 0.2s ease;
-            box-shadow: var(--shadow);
-        }
-        
-        .stButton > button:hover {
-            transform: translateY(-1px);
-            box-shadow: var(--shadow-lg);
-        }
-        
-        /* Input styling */
-        .stTextInput > div > div > input {
-            border-radius: 8px;
-            border: 2px solid var(--border-color);
-            transition: border-color 0.2s ease;
-        }
-        
-        .stTextInput > div > div > input:focus {
-            border-color: var(--secondary-color);
-            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
-        }
-        
-        /* Accessibility features */
-        .audio-toggle {
-            background: linear-gradient(135deg, #10b981, #059669);
-            color: white;
-            padding: 0.5rem 1rem;
-            border-radius: 20px;
-            font-size: 0.9rem;
-            font-weight: 500;
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-            border: none;
-            cursor: pointer;
-            transition: all 0.2s ease;
-        }
-        
-        .audio-toggle:hover {
-            transform: translateY(-1px);
-            box-shadow: var(--shadow);
-        }
-        
-        .audio-toggle.disabled {
-            background: linear-gradient(135deg, #6b7280, #4b5563);
-            cursor: not-allowed;
-        }
-        
-        /* Responsive design */
-        @media (max-width: 768px) {
-            .main-header h1 {
-                font-size: 2rem;
-            }
-            
-            .chat-message {
-                margin-left: 0.5rem;
-                margin-right: 0.5rem;
-                padding: 1rem;
-            }
-            
-            .user-message {
-                margin-left: 0;
-            }
-            
-            .assistant-message {
-                margin-right: 0;
-            }
-            
-            .doc-meta {
-                flex-direction: column;
-                gap: 0.25rem;
-            }
-            
-            .audio-controls {
-                flex-direction: column;
-                gap: 10px;
-            }
-            
-            .audio-controls audio {
-                min-width: unset;
-                width: 100%;
-            }
-        }
-    </style>
-    """
-    
-    # Add RTL-specific CSS if needed
-    rtl_css = get_rtl_css()
-    
-    return base_css + rtl_css
-
-def initialize_session_state() -> None:
-    """Initialize session state variables with proper typing"""
-    if 'messages' not in st.session_state:
-        st.session_state.messages = []
-    if 'documents' not in st.session_state:
-        st.session_state.documents = {}
-    if 'documents_loaded' not in st.session_state:
-        st.session_state.documents_loaded = False
-    if 'total_metadata' not in st.session_state:
-        st.session_state.total_metadata = {}
-    if 'audio_enabled' not in st.session_state:
-        st.session_state.audio_enabled = True  # Enable audio by default
-    if 'selected_voice' not in st.session_state:
-        st.session_state.selected_voice = Config.TTS_VOICE
-    if 'audio_responses' not in st.session_state:
-        st.session_state.audio_responses = {}  # Store audio data for messages
-    
-    # Initialize language system
-    init_language_system()
-
-def clean_text(text: str) -> str:
-    """Clean and normalize extracted text"""
-    if not text:
-        return ""
-    
-    # Remove excessive whitespace
-    text = ' '.join(text.split())
-    
-    # Fix common encoding issues
-    text = text.replace('\u2019', "'")  # Right single quotation mark
-    text = text.replace('\u2018', "'")  # Left single quotation mark
-    text = text.replace('\u201c', '"')  # Left double quotation mark
-    text = text.replace('\u201d', '"')  # Right double quotation mark
-    text = text.replace('\u2013', '-')  # En dash
-    text = text.replace('\u2014', '-')  # Em dash
-    text = text.replace('\u2026', '...')  # Horizontal ellipsis
-    
-    # Remove excessive line breaks but preserve paragraph structure
-    text = '\n'.join(line.strip() for line in text.split('\n') if line.strip())
-    
-    return text
-
-def extract_docx_with_mammoth(file_path: Path) -> Tuple[Optional[str], Dict[str, Any]]:
-    """Alternative DOCX extraction using mammoth library (fallback method)"""
-    try:
-        import mammoth
-        
-        with open(file_path, "rb") as docx_file:
-            result = mammoth.extract_raw_text(docx_file)
-            text = result.value
-            
-            if result.messages:
-                logger.warning(f"Mammoth extraction warnings for {file_path.name}: {result.messages}")
-            
-            # Clean the text
-            text = clean_text(text)
-            
-            # Basic metadata
-            metadata = {
-                'file_size': file_path.stat().st_size,
-                'file_type': 'Word Document (Mammoth)',
-                'word_count': len(text.split()) if text else 0,
-                'character_count': len(text),
-                'extraction_method': 'mammoth'
-            }
-            
-            return text if text.strip() else None, metadata
-            
-    except ImportError:
-        logger.warning("Mammoth library not available for enhanced DOCX extraction")
-        return None, {}
-    except Exception as e:
-        logger.error(f"Mammoth extraction failed for {file_path.name}: {e}")
-        return None, {}
-
-def read_pdf(file_path: Path) -> Tuple[Optional[str], Dict[str, Any]]:
-    """Read PDF file and extract metadata"""
-    try:
-        reader = PdfReader(str(file_path))
-        text = ""
-        total_pages = len(reader.pages)
-        
-        # Extract text
-        for page_num, page in enumerate(reader.pages):
-            try:
-                page_text = page.extract_text()
-                if page_text and page_text.strip():
-                    text += f"\n--- Page {page_num + 1} ---\n"
-                    text += page_text
-            except Exception as e:
-                logger.warning(f"Error extracting text from page {page_num + 1} in {file_path.name}: {e}")
-                continue
-        
-        # Metadata
-        metadata = {
-            'total_pages': total_pages,
-            'file_size': file_path.stat().st_size,
-            'file_type': 'PDF',
-            'word_count': len(text.split()) if text else 0,
-            'character_count': len(text),
-        }
-        
-        return text, metadata
-        
-    except Exception as e:
-        logger.error(f"Error reading PDF {file_path.name}: {e}")
-        return None, {}
-
-def read_docx(file_path: Path) -> Tuple[Optional[str], Dict[str, Any]]:
-    """Read DOCX file with multiple extraction methods for better compatibility"""
-    
-    # Method 1: Try enhanced python-docx extraction
-    try:
-        doc = Document(str(file_path))
-        text_parts = []
-        paragraph_count = 0
-        
-        # Extract text from paragraphs with better formatting
-        for paragraph in doc.paragraphs:
-            para_text = paragraph.text.strip()
-            if para_text:
-                # Handle different paragraph styles
-                if paragraph.style.name.startswith('Heading'):
-                    text_parts.append(f"\n## {para_text}\n")
-                else:
-                    text_parts.append(para_text)
-                paragraph_count += 1
-        
-        # Extract text from tables with structure preservation
-        table_count = len(doc.tables)
-        for table_idx, table in enumerate(doc.tables):
-            text_parts.append(f"\n--- Table {table_idx + 1} ---")
-            for row_idx, row in enumerate(table.rows):
-                row_text = []
-                for cell in row.cells:
-                    cell_text = cell.text.strip()
-                    if cell_text:
-                        row_text.append(cell_text)
-                if row_text:
-                    text_parts.append(" | ".join(row_text))
-            text_parts.append("--- End Table ---\n")
-        
-        # Extract text from headers and footers
-        for section in doc.sections:
-            # Header
-            if section.header:
-                for paragraph in section.header.paragraphs:
-                    header_text = paragraph.text.strip()
-                    if header_text:
-                        text_parts.append(f"[Header: {header_text}]")
-            
-            # Footer
-            if section.footer:
-                for paragraph in section.footer.paragraphs:
-                    footer_text = paragraph.text.strip()
-                    if footer_text:
-                        text_parts.append(f"[Footer: {footer_text}]")
-        
-        # Combine all text parts
-        full_text = "\n".join(text_parts)
-        
-        # Clean up the text
-        full_text = clean_text(full_text)
-        
-        # If we got good content, return it
-        if full_text and len(full_text.strip()) > 50:  # Minimum content threshold
-            metadata = {
-                'paragraphs': paragraph_count,
-                'tables': table_count,
-                'file_size': file_path.stat().st_size,
-                'file_type': 'Word Document',
-                'word_count': len(full_text.split()) if full_text else 0,
-                'character_count': len(full_text),
-                'extraction_method': 'python-docx'
-            }
-            return full_text, metadata
-        
-    except Exception as e:
-        logger.warning(f"python-docx extraction failed for {file_path.name}: {e}")
-    
-    # Method 2: Try mammoth library as fallback
-    logger.info(f"Trying alternative extraction method for {file_path.name}")
-    mammoth_text, mammoth_metadata = extract_docx_with_mammoth(file_path)
-    
-    if mammoth_text and len(mammoth_text.strip()) > 50:
-        return mammoth_text, mammoth_metadata
-    
-    # Method 3: Try raw XML extraction as last resort
-    try:
-        import xml.etree.ElementTree as ET
-        from zipfile import ZipFile
-        
-        logger.info(f"Trying XML extraction for {file_path.name}")
-        
-        text_parts = []
-        with ZipFile(str(file_path), 'r') as docx_zip:
-            if 'word/document.xml' in docx_zip.namelist():
-                xml_content = docx_zip.read('word/document.xml')
-                root = ET.fromstring(xml_content)
-                
-                # Extract all text nodes
-                for text_elem in root.iter():
-                    if text_elem.tag.endswith('}t') and text_elem.text:
-                        clean_elem_text = text_elem.text.strip()
-                        if clean_elem_text and len(clean_elem_text) > 1:
-                            text_parts.append(clean_elem_text)
-        
-        if text_parts:
-            full_text = " ".join(text_parts)
-            full_text = clean_text(full_text)
-            
-            if full_text and len(full_text.strip()) > 50:
-                metadata = {
-                    'file_size': file_path.stat().st_size,
-                    'file_type': 'Word Document (XML)',
-                    'word_count': len(full_text.split()),
-                    'character_count': len(full_text),
-                    'extraction_method': 'xml'
-                }
-                return full_text, metadata
-                
-    except Exception as xml_e:
-        logger.error(f"XML extraction also failed for {file_path.name}: {xml_e}")
-    
-    # If all methods failed
-    logger.error(f"All extraction methods failed for {file_path.name}")
-    return None, {
-        'file_size': file_path.stat().st_size,
-        'file_type': 'Word Document (Failed)',
-        'extraction_method': 'failed',
-        'error': 'Could not extract text content'
-    }
-
-@st.cache_data(show_spinner=False)
-def load_all_documents() -> Tuple[Dict[str, Dict], str, Dict[str, Any]]:
-    """
-    Load all documents from the data folder with detailed debugging
-    
-    Returns:
-        Tuple of (documents_dict, status_message, total_metadata)
-    """
-    data_path = Path(Config.DATA_FOLDER)
-    
-    if not data_path.exists():
-        return {}, t('data_folder_not_found', folder=Config.DATA_FOLDER), {}
-    
-    documents = {}
-    total_files = 0
-    successful_loads = 0
-    failed_loads = []
-    total_words = 0
-    total_pages = 0
-    total_size = 0
-    
-    # Find all supported files
-    supported_files = []
-    for ext in Config.SUPPORTED_EXTENSIONS:
-        found_files = list(data_path.glob(f"*{ext}"))
-        supported_files.extend(found_files)
-        logger.info(f"Found {len(found_files)} {ext} files")
-    
-    logger.info(f"Total supported files found: {len(supported_files)}")
-    
-    if not supported_files:
-        # List all files in the directory for debugging
-        all_files = list(data_path.glob("*"))
-        file_list = [f.name for f in all_files]
-        return {}, t('no_supported_docs', folder=Config.DATA_FOLDER, files=file_list), {}
-    
-    # Process each file with detailed logging
-    for file_path in supported_files:
-        total_files += 1
-        logger.info(f"Processing: {file_path.name}")
-        
-        try:
-            if file_path.suffix.lower() == '.pdf':
-                logger.info(f"Reading PDF: {file_path.name}")
-                content, metadata = read_pdf(file_path)
-            elif file_path.suffix.lower() == '.docx':
-                logger.info(f"Reading DOCX: {file_path.name}")
-                content, metadata = read_docx(file_path)
-            else:
-                logger.warning(f"Unsupported file type: {file_path.name}")
-                continue
-            
-            if content and content.strip():
-                documents[file_path.name] = {
-                    'content': content,
-                    'metadata': metadata,
-                    'file_path': str(file_path)
-                }
-                successful_loads += 1
-                total_words += metadata.get('word_count', 0)
-                total_pages += metadata.get('total_pages', metadata.get('paragraphs', 0))
-                total_size += metadata.get('file_size', 0)
-                logger.info(f"✅ Successfully loaded {file_path.name} - {metadata.get('word_count', 0)} words")
-            else:
-                failed_loads.append({
-                    'file': file_path.name,
-                    'reason': 'No content extracted',
-                    'metadata': metadata
-                })
-                logger.warning(f"❌ Failed to extract content from {file_path.name}")
-            
-        except Exception as e:
-            failed_loads.append({
-                'file': file_path.name,
-                'reason': str(e),
-                'metadata': {}
-            })
-            logger.error(f"Error processing {file_path.name}: {e}")
-            continue
-    
-    # Calculate total metadata
-    total_metadata = {
-        'total_files': total_files,
-        'successful_loads': successful_loads,
-        'failed_loads': len(failed_loads),
-        'failed_files': failed_loads,
-        'total_words': total_words,
-        'total_pages': total_pages,
-        'total_size': total_size,
-        'estimated_reading_time': max(1, total_words // 200)
-    }
-    
-    if successful_loads == 0:
-        status_message = t('failed_to_load', errors=failed_loads)
-    elif failed_loads:
-        status_message = t('loaded_docs_status', success=successful_loads, total=total_files, failed=len(failed_loads))
-    else:
-        status_message = t('all_docs_loaded', success=successful_loads, total=total_files)
-    
-    return documents, status_message, total_metadata
-
-def format_file_size(size_bytes: int) -> str:
-    """Format file size in human readable format"""
-    if size_bytes == 0:
-        return "0 B"
-    
-    size_names = ["B", "KB", "MB", "GB"]
-    i = 0
-    while size_bytes >= 1024 and i < len(size_names) - 1:
-        size_bytes /= 1024.0
-        i += 1
-    
-    return f"{size_bytes:.1f} {size_names[i]}"
-
-def search_documents(question: str, documents: Dict[str, Dict]) -> str:
-    """
-    Search across all documents and generate AI response with multi-language support
-    
-    Args:
-        question: User's question
-        documents: Dictionary of all loaded documents
-        
-    Returns:
-        AI response string with source attribution
-    """
-    # Handle greetings in multiple languages
-    greetings = {
-        'en': ['hello', 'hi', 'hey', 'good morning', 'good afternoon', 'good evening'],
-        'ar': ['مرحبا', 'أهلا', 'السلام عليكم', 'صباح الخير', 'مساء الخير'],
-        'fr': ['bonjour', 'salut', 'bonsoir', 'coucou'],
-        'es': ['hola', 'buenos días', 'buenas tardes', 'buenas noches']
-    }
-    
-    question_clean = question.lower().strip()
-    current_lang = language_manager.current_language
-    
-    # Check for greetings in current language
-    is_greeting = False
-    for lang, greeting_list in greetings.items():
-        if any(greeting in question_clean for greeting in greeting_list):
-            is_greeting = True
-            break
-    
-    if is_greeting:
-        doc_count = len(documents)
-        doc_list = ", ".join(list(documents.keys())[:3])
-        if doc_count > 3:
-            doc_list += f" {t('and_more')}"
-        
-        return t('hello_response', 
-                app_name=t('app_title'),
-                doc_count=doc_count,
-                doc_list=doc_list)
-    
-    if not client:
-        return f"🔑 **{t('api_key_missing')}**"
-    
-    if not documents:
-        return f"📄 **{t('no_docs_error')}**"
-    
-    try:
-        # Prepare document content for search
-        combined_content = ""
-        doc_sections = []
-        
-        for doc_name, doc_data in documents.items():
-            content = doc_data['content'][:Config.MAX_CONTENT_LENGTH // len(documents)]  # Distribute content evenly
-            
-            doc_section = f"\n\n=== DOCUMENT: {doc_name} ===\n{content}\n=== END OF {doc_name} ==="
-            combined_content += doc_section
-            doc_sections.append({
-                'name': doc_name,
-                'content': content,
-                'type': doc_data['metadata'].get('file_type', 'Unknown')
-            })
-        
-        # Create document info for prompt
-        documents_info = "\n".join([f"- {doc['name']} ({doc['type']})" for doc in doc_sections])
-        
-        # Get language-specific system prompt
-        system_prompt = get_language_specific_ai_prompt(documents_info, combined_content)
-        
-        response = client.chat.completions.create(
-            model=Config.MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": question}
-            ],
-            max_tokens=Config.MAX_TOKENS,
-            temperature=Config.TEMPERATURE,
-        )
-        
-        return response.choices[0].message.content.strip()
-        
-    except Exception as e:
-        if "rate_limit" in str(e).lower():
-            return f"⚠️ **{t('rate_limit_error')}**"
-        elif "authentication" in str(e).lower() or "api_key" in str(e).lower():
-            return f"🔑 **{t('auth_error')}**"
-        elif "invalid" in str(e).lower():
-            return f"❌ **{t('invalid_request', error=str(e))}**"
-        else:
-            logger.error(f"Error generating AI response: {e}")
-            return f"❌ **{t('response_error', error=str(e))}**"
+def create_audio_folder():
+    """Create audio folder if it doesn't exist"""
+    audio_path = Path(Config.AUDIO_FOLDER)
+    audio_path.mkdir(exist_ok=True)
+    return audio_path
 
 def render_voice_selector():
     """Render voice selector in sidebar"""
@@ -1129,254 +450,645 @@ def render_voice_selector():
                 st.error(t('audio_error', default='Failed to generate audio'))
     else:
         st.info(t('audio_disabled', default='Audio responses are disabled'))
+def read_document(file_path: Path) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Read PDF or DOCX document"""
+        try:
+            if file_path.suffix.lower() == '.pdf':
+                return read_pdf(file_path)
+            elif file_path.suffix.lower() == '.docx':
+                return read_docx(file_path)
+            else:
+                return None, {'error': f'Unsupported file type: {file_path.suffix}'}
+        except Exception as e:
+            logger.error(f"Error reading document {file_path}: {e}")
+            return None, {'error': str(e)}
 
-def render_sidebar() -> None:
-    """Render enhanced sidebar with multi-document information, language selector, and voice settings"""
-    with st.sidebar:
-        # Language selector at the top
-        st.markdown(f"### 🌐 {t('language_selector')}")
-        render_language_selector()
+def read_pdf(file_path: Path) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Read PDF file and extract metadata"""
+    try:
+        reader = PdfReader(str(file_path))
+        text = ""
+        total_pages = len(reader.pages)
         
-        st.markdown("---")
+        for page_num, page in enumerate(reader.pages):
+            try:
+                page_text = page.extract_text()
+                if page_text and page_text.strip():
+                    text += f"\n--- Page {page_num + 1} ---\n"
+                    text += page_text
+            except Exception as e:
+                logger.warning(f"Error extracting text from page {page_num + 1}: {e}")
+                continue
         
-        # Voice settings
-        render_voice_selector()
+        metadata = {
+            'total_pages': total_pages,
+            'file_size': file_path.stat().st_size,
+            'file_type': 'PDF',
+            'word_count': len(text.split()) if text else 0,
+            'character_count': len(text),
+        }
         
-        st.markdown("---")
+        return text, metadata
         
-        st.markdown(f"### 📚 {t('document_library')}")
+    except Exception as e:
+        logger.error(f"Error reading PDF {file_path.name}: {e}")
+        return None, {'error': str(e)}
+
+def read_docx(file_path: Path) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Read DOCX file"""
+    try:
+        doc = Document(str(file_path))
+        text_parts = []
+        paragraph_count = 0
         
-        # Load documents if not already loaded
-        if not st.session_state.documents_loaded:
-            with st.spinner(t('loading_docs')):
-                documents, message, total_metadata = load_all_documents()
-                st.session_state.documents = documents
-                st.session_state.documents_loaded = len(documents) > 0
-                st.session_state.total_metadata = total_metadata
+        for paragraph in doc.paragraphs:
+            para_text = paragraph.text.strip()
+            if para_text:
+                text_parts.append(para_text)
+                paragraph_count += 1
         
-        # Display loading status
-        if st.session_state.documents_loaded:
-            total_meta = st.session_state.total_metadata
-            
-            st.markdown(f"""
-            <div class="status-success">
-                ✅ {t('docs_loaded', count=total_meta['successful_loads'])}
-            </div>
-            """, unsafe_allow_html=True)
-            
-            st.markdown("---")
-            
-            # Overall statistics
-            st.markdown(f"""
-            <div class="sidebar-info">
-                <div class="info-item">
-                    <span class="info-label">📁 {t('total_files')}:</span>
-                    <span class="info-value">{total_meta['successful_loads']}</span>
-                </div>
-                <div class="info-item">
-                    <span class="info-label">📝 {t('total_words')}:</span>
-                    <span class="info-value">{total_meta['total_words']:,}</span>
-                </div>
-                <div class="info-item">
-                    <span class="info-label">📊 {t('total_pages')}:</span>
-                    <span class="info-value">{total_meta['total_pages']}</span>
-                </div>
-                <div class="info-item">
-                    <span class="info-label">💾 {t('total_size')}:</span>
-                    <span class="info-value">{format_file_size(total_meta['total_size'])}</span>
-                </div>
-                <div class="info-item">
-                    <span class="info-label">⏱️ {t('reading_time')}:</span>
-                    <span class="info-value">~{total_meta['estimated_reading_time']} {t('minutes')}</span>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            # Individual document list
-            with st.expander(f"📄 {t('document_details')}", expanded=False):
-                for doc_name, doc_data in st.session_state.documents.items():
-                    metadata = doc_data['metadata']
-                    st.markdown(f"""
-                    <div class="doc-item">
-                        <div class="doc-name">📄 {doc_name}</div>
-                        <div class="doc-meta">
-                            <span>{t('file_type')}: {metadata.get('file_type', 'Unknown')}</span>
-                            <span>{t('words')}: {metadata.get('word_count', 0):,}</span>
-                            <span>{t('size')}: {format_file_size(metadata.get('file_size', 0))}</span>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-            
+        # Extract text from tables
+        table_count = len(doc.tables)
+        for table_idx, table in enumerate(doc.tables):
+            text_parts.append(f"\n--- Table {table_idx + 1} ---")
+            for row in table.rows:
+                row_text = []
+                for cell in row.cells:
+                    cell_text = cell.text.strip()
+                    if cell_text:
+                        row_text.append(cell_text)
+                if row_text:
+                    text_parts.append(" | ".join(row_text))
+        
+        full_text = "\n".join(text_parts)
+        
+        metadata = {
+            'paragraphs': paragraph_count,
+            'tables': table_count,
+            'file_size': file_path.stat().st_size,
+            'file_type': 'Word Document',
+            'word_count': len(full_text.split()) if full_text else 0,
+            'character_count': len(full_text),
+        }
+        
+        return full_text, metadata
+        
+    except Exception as e:
+        logger.error(f"Error reading DOCX {file_path.name}: {e}")
+        return None, {'error': str(e)}
+
+def load_document_for_module(module_data: Dict) -> Tuple[Optional[str], Dict[str, Any], str]:
+    """Load the PDF document for a specific module"""
+    try:
+        pdf_filename = module_data['pdf_file']
+        pdf_path = Path(Config.DATA_FOLDER) / pdf_filename
+        
+        if not pdf_path.exists():
+            return None, {}, f"Document not found: {pdf_filename}"
+        
+        content, metadata = read_document(pdf_path)
+        
+        if content:
+            return content, metadata, f"Loaded {pdf_filename} successfully"
         else:
-            st.markdown(f"""
-            <div class="status-error">
-                ❌ {t('no_docs_loaded')}
-            </div>
-            """, unsafe_allow_html=True)
+            return None, metadata, f"Failed to extract content from {pdf_filename}"
             
-            st.info(f"📁 {t('looking_in', folder=f'`{Config.DATA_FOLDER}/`')}")
-            st.info(t('supported_formats'))
-        
-        st.markdown("---")
-        
-        # Controls
-        st.markdown(f"### 🔧 {t('controls')}")
-        
-        # Clear chat button
-        if st.button(f"🗑️ {t('clear_chat')}", type="secondary", use_container_width=True):
-            st.session_state.messages = []
-            st.session_state.audio_responses = {}  # Clear audio responses too
-            st.rerun()
-        
-        # Reload documents button
-        if st.button(f"🔄 {t('reload_docs')}", type="secondary", use_container_width=True):
-            st.cache_data.clear()
-            st.session_state.documents = {}
-            st.session_state.documents_loaded = False
-            st.session_state.total_metadata = {}
-            st.rerun()
+    except Exception as e:
+        logger.error(f"Error loading document for module: {e}")
+        return None, {}, f"Error: {str(e)}"
 
-def render_chat_interface() -> None:
-    """Render the main chat interface with audio support and voice input"""
+def generate_ai_response(question: str, document_content: str, module_info: Dict) -> str:
+    """Generate AI response based on document content and module context"""
+    if not client:
+        return f"🔑 **{t('api_key_missing')}**"
     
-    # Load logo
-    logo_base64 = load_logo()
+    if not document_content:
+        return f"📄 **No document content available for {module_info['module']}**"
     
-    # Create header with or without logo
+    try:
+        # Create context-aware prompt
+        system_prompt = f"""You are an expert academic assistant for University of Roehampton students. You are helping with the module: "{module_info['module']}" from the {module_info['programme']} programme.
+
+DOCUMENT CONTENT:
+{document_content[:Config.MAX_CONTENT_LENGTH]}
+
+INSTRUCTIONS:
+- Answer questions based ONLY on the provided document content
+- Be helpful and educational, explaining concepts clearly
+- If information isn't in the document, say so clearly
+- Provide specific references to sections of the document when possible
+- Help with coursework understanding, but don't do the work for the student
+- Encourage critical thinking and learning
+- Be supportive and encouraging
+
+CONTEXT:
+- Module: {module_info['module']}
+- Programme: {module_info['programme']}
+- Document: {module_info['pdf_file']}
+
+Remember: You are helping a Roehampton University student understand their coursework materials."""
+
+        response = client.chat.completions.create(
+            model=Config.MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": question}
+            ],
+            max_tokens=Config.MAX_TOKENS,
+            temperature=Config.TEMPERATURE,
+        )
+        
+        return response.choices[0].message.content.strip()
+        
+    except Exception as e:
+        logger.error(f"Error generating AI response: {e}")
+        return f"❌ **Error generating response: {str(e)}**"
+
+def reset_conversation():
+    """Reset conversation to welcome state"""
+    # Reset conversation flow states
+    st.session_state.conversation_step = 'welcome'
+    
+    # Reset authentication data
+    st.session_state.student_id = None
+    st.session_state.student_code = None
+    st.session_state.student_data = None
+    st.session_state.selected_path = None
+    
+    # Reset module and coursework selection
+    st.session_state.available_modules = []
+    st.session_state.selected_module = None
+    st.session_state.selected_coursework = None
+    st.session_state.current_document = None
+    
+    # Reset chat data
+    st.session_state.messages = []
+    st.session_state.audio_responses = {}
+    
+    # Reset error handling
+    st.session_state.error_message = None
+    st.session_state.retry_count = 0
+
+     # Reset ethics-specific states
+    st.session_state.selected_ethics_category = None
+    if 'ethics_document' in st.session_state:
+        del st.session_state.ethics_document
+    
+    # Reset ethics-specific states if they exist
+    if 'selected_ethics_category' in st.session_state:
+        st.session_state.selected_ethics_category = None
+
+def render_progress_indicator():
+    """Render progress indicator for guided flow"""
+    steps = {
+        'welcome': 1,
+        'path_selection': 1,
+        'student_id': 2,
+        'code': 3,
+        'module': 4,
+        'coursework': 5,
+        'chat': 6
+    }
+    
+    current_step = steps.get(st.session_state.conversation_step, 1)
+    total_steps = 6
+    
+    progress = current_step / total_steps
+    
+    st.progress(progress)
+    st.caption(f"Step {current_step} of {total_steps}")
+
+   
+
+def render_welcome_screen():
+    """Render welcome screen with official Roehampton University branding"""
+    
+    # Load logo from assets folder
+    logo_base64 = load_logo_from_assets()
+    
     if logo_base64:
-        header_html = f"""
-        <div class="main-header">
-            <div class="header-content">
-                <div class="logo-container">
-                    <img src="data:image/png;base64,{logo_base64}" alt="University of Roehampton Logo" class="logo">
-                    <div>
-                        <h1>🎓 {t('app_title', default='Roehampton University Chatbot')}</h1>
-                    </div>
+        # Welcome screen with Roehampton logo
+        st.markdown(f"""
+        <div class="roehampton-header">
+            <div class="logo-title-container">
+                <img src="data:image/png;base64,{logo_base64}" alt="University of Roehampton Logo" class="roehampton-logo">
+                <div>
+                    <h1>University Assistant</h1>
                 </div>
-                <p>{t('app_subtitle', default='Intelligent document assistant for University of Roehampton')} • {t('powered_by', default='Powered by AI')} • 🔊 {t('audio_enabled_label', default='Audio Enabled')} • 🎤 {t('voice_input_label', default='Voice Input Available')}</p>
             </div>
+            <p>Your intelligent academic companion for coursework and ethics guidance</p>
         </div>
-        """
+        """, unsafe_allow_html=True)
     else:
-        header_html = f"""
-        <div class="main-header">
-            <div class="header-content">
-                <h1>🎓 {t('app_title', default='Roehampton University Chatbot')}</h1>
-                <p>{t('app_subtitle', default='Intelligent document assistant for University of Roehampton')} • {t('powered_by', default='Powered by AI')} • 🔊 {t('audio_enabled_label', default='Audio Enabled')} • 🎤 {t('voice_input_label', default='Voice Input Available')}</p>
-            </div>
+        # Welcome screen without logo (fallback)
+        st.markdown("""
+        <div class="roehampton-header">
+            <h1>🎓 University of Roehampton Assistant</h1>
+            <p>Your intelligent academic companion for coursework and ethics guidance</p>
         </div>
-        """
+        """, unsafe_allow_html=True)
     
-    st.markdown(header_html, unsafe_allow_html=True)
+    st.markdown("### How can I help you today?")
     
-    # Check prerequisites
-    if not OPENAI_API_KEY:
-        st.error(f"🔑 **{t('api_key_not_found')}**")
-        st.info(t('add_api_key'))
-        st.code("OPENAI_API_KEY=sk-your-api-key-here")
-        st.stop()
+    col1, col2 = st.columns(2)
     
-    if not st.session_state.documents_loaded:
-        st.error(f"📚 **{t('no_docs_error')}**")
-        st.info(t('looking_for_files', folder=f"`{Config.DATA_FOLDER}/`"))
+    with col1:
+        if st.button("📋 Ethics Document Help", 
+                    help="Get assistance with ethics-related documents and guidelines",
+                    use_container_width=True,
+                    type="primary",
+                    key="welcome_ethics_btn"):  # ← ADD THIS KEY
+            st.session_state.selected_path = 'ethics'
+            st.session_state.conversation_step = 'student_id'
+            st.rerun()
+    
+    with col2:
+        if st.button("📚 University Coursework Help", 
+                    help="Get help with your specific coursework materials",
+                    use_container_width=True,
+                    type="primary",
+                    key="welcome_coursework_btn"):  # ← ADD THIS KEY
+            st.session_state.selected_path = 'coursework'
+            st.session_state.conversation_step = 'student_id'
+            st.rerun()
+    
+    # Feature highlights with Roehampton branding
+    st.markdown("---")
+    
+    st.markdown("""
+    <div class="feature-grid">
+        <div class="feature-card">
+            <div class="feature-icon">📋</div>
+            <div class="feature-title">Ethics Guidance</div>
+            <div class="feature-description">Access comprehensive ethics guidance based on university policies and the "Reforming Modernity" framework</div>
+        </div>
+        <div class="feature-card">
+            <div class="feature-icon">📚</div>
+            <div class="feature-title">Coursework Support</div>
+            <div class="feature-description">Get personalized help with your module materials, assignments, and academic questions</div>
+        </div>
+        <div class="feature-card">
+            <div class="feature-icon">🔐</div>
+            <div class="feature-title">Secure Access</div>
+            <div class="feature-description">Student authentication ensures you only access your own academic materials and information</div>
+        </div>
+        <div class="feature-card">
+            <div class="feature-icon">🎤</div>
+            <div class="feature-title">Audio Support</div>
+            <div class="feature-description">Listen to responses with text-to-speech functionality for enhanced accessibility</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # col1, col2 = st.columns(2)
+    
+    # with col1:
+    #     if st.button("📋 Ethics Document Help", 
+    #                 help="Get assistance with ethics-related documents and guidelines",
+    #                 use_container_width=True,
+    #                 type="primary"):
+    #         st.session_state.selected_path = 'ethics'
+    #         st.session_state.conversation_step = 'student_id'
+    #         st.rerun()
+    
+    # with col2:
+    #     if st.button("📚 University Coursework Help", 
+    #                 help="Get help with your specific coursework materials",
+    #                 use_container_width=True,
+    #                 type="primary"):
+    #         st.session_state.selected_path = 'coursework'
+    #         st.session_state.conversation_step = 'student_id'
+    #         st.rerun()
+    
+    # Additional information
+    st.markdown("---")
+    st.markdown("""
+    **What you can do:**
+    - 📋 **Ethics Documents**: Access university ethics guidelines and policies
+    - 📚 **Coursework Help**: Get assistance with your enrolled modules and assignments
+    - 🔐 **Secure Access**: Authentication ensures you only see your own materials
+    - 🎤 **Audio Support**: Listen to responses with text-to-speech functionality
+    """)
+
+def render_student_id_input():
+    """Render student ID input screen"""
+    st.markdown(f"### 🆔 Step 2: Enter Your Student ID")
+    st.markdown(f"Please enter your Roehampton University Student ID to continue with **{st.session_state.selected_path}** assistance.")
+    
+    # Show error if exists
+    if st.session_state.error_message:
+        st.error(st.session_state.error_message)
+        if st.session_state.retry_count > 2:
+            st.warning("Having trouble? Please contact IT support or check your credentials.")
+    
+    student_id = st.text_input(
+        "Student ID:",
+        placeholder="e.g., A00034131",
+        help="Enter your complete Roehampton University Student ID",
+        key="student_id_input" 
+    )
+    
+    col1, col2 = st.columns([1, 3])
+    
+    with col1:
+        if st.button("🔙 Back", 
+                    type="secondary",
+                    key="student_id_back_btn"):  # ← ADD THIS KEY
+            st.session_state.conversation_step = 'welcome'
+            st.session_state.error_message = None
+            st.session_state.retry_count = 0
+            st.rerun()
+    
+    with col2:
+        if st.button("Next ➡️", 
+                    type="primary", 
+                    disabled=not student_id.strip(),
+                    key="student_id_next_btn"):  # ← ADD THIS KEY
+            if student_id.strip():
+                st.session_state.student_id = student_id.strip().upper()
+                st.session_state.conversation_step = 'code'
+                st.session_state.error_message = None
+                st.rerun()
+
+def render_code_input():
+    """Render access code input screen"""
+    st.markdown(f"### 🔐 Step 3: Enter Your Access Code")
+    st.markdown(f"Student ID: **{st.session_state.student_id}**")
+    st.markdown("Please enter your unique access code to verify your identity.")
+    
+    # Show error if exists
+    if st.session_state.error_message:
+        st.error(st.session_state.error_message)
+    
+    code = st.text_input(
+        "Access Code:",
+        type="password",
+        placeholder="Enter your unique code",
+        help="Enter the numerical code provided to you",
+        key="access_code_input"
+    )
+    
+    col1, col2 = st.columns([1, 3])
+    
+    with col1:
+        if st.button("🔙 Back", 
+                    type="secondary",
+                    key="code_back_btn"):  # ← ADD THIS KEY
+            st.session_state.conversation_step = 'student_id'
+            st.session_state.error_message = None
+            st.rerun()
+    
+    with col2:
+        if st.button("Verify ✅", 
+                    type="primary", 
+                    disabled=not code.strip(),
+                    key="code_verify_btn"):  # ← ADD THIS KEY
+            if code.strip():
+                # Validate credentials
+                is_valid, student_data, message = validate_student_credentials(
+                    st.session_state.student_id, 
+                    code
+                )
+                
+                if is_valid:
+                    st.session_state.student_code = code
+                    st.session_state.student_data = student_data
+                    st.session_state.available_modules = student_data['modules']
+                    st.session_state.error_message = None
+                    st.session_state.retry_count = 0
+                    
+                    if st.session_state.selected_path == 'ethics':
+                        st.session_state.conversation_step = 'ethics_chat'
+                    else:
+                        st.session_state.conversation_step = 'module'
+                    
+                    st.success(f"✅ Welcome, {st.session_state.student_id}!")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.session_state.error_message = message
+                    st.session_state.retry_count += 1
+                    st.rerun()
+                
+
+def render_module_selection():
+    """Render module selection screen"""
+    st.markdown(f"### 📚 Step 4: Select Your Module")
+    st.markdown(f"Welcome, **{st.session_state.student_id}**!")
+    st.markdown(f"Programme: **{st.session_state.student_data['programme']}**")
+    st.markdown("Please select the module you need help with:")
+    
+    if not st.session_state.available_modules:
+        st.error("No modules found for your account. Please contact support.")
         return
     
-    # Chat messages container
-    chat_container = st.container()
-    
-    with chat_container:
-        if not st.session_state.messages:
-            # Empty state
-            doc_count = len(st.session_state.documents)
-            doc_names = list(st.session_state.documents.keys())
+    # Display modules as cards
+    for i, module in enumerate(st.session_state.available_modules):
+        with st.container():
+            col1, col2 = st.columns([3, 1])
             
-            st.markdown(f"""
-            <div class="empty-state">
-                <div class="empty-state-icon">🔍</div>
-                <h3>{t('ready_to_search', count=doc_count)}</h3>
-                <p>{t('search_through', docs=f"<strong>{', '.join(doc_names[:3])}</strong>{f' {t("and_more")}' if doc_count > 3 else ''}")}</p>
-                <p>{t('try_asking')}</p>
-                <ul style="text-align: left; display: inline-block;">
-                    <li>"{t('example_1')}"</li>
-                    <li>"{t('example_2')}"</li>
-                    <li>"{t('example_3')}"</li>
-                    <li>"{t('example_4')}"</li>
-                </ul>
-                <div style="margin-top: 20px; padding: 15px; background: linear-gradient(135deg, #10b981, #059669); color: white; border-radius: 10px;">
-                    <h4 style="margin: 0 0 10px 0;">🔊 {t('accessibility_note', default='Accessibility Feature')}</h4>
-                    <p style="margin: 0; opacity: 0.9;">{t('audio_description', default='This app includes audio responses to help users who cannot read or prefer audio output. Enable audio in the sidebar and choose your preferred voice.')}</p>
+            with col1:
+                st.markdown(f"""
+                <div style="padding: 1rem; border: 1px solid #ddd; border-radius: 8px; margin-bottom: 1rem;">
+                    <h4 style="margin: 0 0 0.5rem 0;">{module['module']}</h4>
+                    <p style="margin: 0; color: #666;">PDF: {module['pdf_file']}</p>
                 </div>
+                """, unsafe_allow_html=True)
+            
+            with col2:
+                if st.button("Select", 
+                            key=f"module_select_{i}",  # ← ADD THIS KEY
+                            type="primary"):
+                    st.session_state.selected_module = module
+                    st.session_state.conversation_step = 'coursework'
+                    st.rerun()
+    
+    # Back button
+    if st.button("🔙 Back to Code", type="secondary"):
+        st.session_state.conversation_step = 'code'
+        st.rerun()
+
+def render_coursework_selection():
+    """Render coursework selection screen"""
+    st.markdown(f"### 📋 Step 5: Coursework Assistance")
+    st.markdown(f"Module: **{st.session_state.selected_module['module']}**")
+    st.markdown("What type of coursework help do you need?")
+    
+    # Coursework options
+    coursework_options = [
+        {
+            'title': 'Assignment Questions',
+            'description': 'Help understanding assignment requirements and questions',
+            'type': 'assignment'
+        },
+        {
+            'title': 'Reading Materials',
+            'description': 'Assistance with course readings and materials',
+            'type': 'reading'
+        },
+        {
+            'title': 'Concepts & Theory',
+            'description': 'Explanation of key concepts and theories',
+            'type': 'concepts'
+        },
+        {
+            'title': 'Exam Preparation',
+            'description': 'Help preparing for examinations',
+            'type': 'exam'
+        },
+        {
+            'title': 'General Questions',
+            'description': 'Any other questions about the module',
+            'type': 'general'
+        }
+    ]
+    
+    for option in coursework_options:
+        if st.button(
+            f"📝 {option['title']}", 
+            help=option['description'],
+            use_container_width=True,
+            key=f"coursework_{option['type']}"
+        ):
+            st.session_state.selected_coursework = option
+            st.session_state.conversation_step = 'chat'
+            st.rerun()
+    
+    # Back button
+    if st.button("🔙 Back to Modules", type="secondary"):
+        st.session_state.conversation_step = 'module'
+        st.rerun()
+
+def render_chat_interface():
+    """Render the chat interface for the selected module/coursework"""
+    
+    if st.session_state.selected_path == 'ethics':
+        # Handle ethics path
+         if ETHICS_AVAILABLE:
+            render_ethics_chat_interface()
+         else:
+            st.error("Ethics assistance is not available.")
+            st.info("Please ensure 'reforming_modernity.pdf' is in your data folder and ethics_handler.py is properly configured.")
+         return
+    
+    # Handle coursework path
+    # Load document if not already loaded
+    if not st.session_state.current_document and st.session_state.selected_module:
+        with st.spinner("Loading your module materials..."):
+            content, metadata, message = load_document_for_module(st.session_state.selected_module)
+            if content:
+                st.session_state.current_document = {
+                    'content': content,
+                    'metadata': metadata,
+                    'module': st.session_state.selected_module
+                }
+                st.success(message)
+            else:
+                st.error(message)
+                return
+    
+    # Header for coursework
+    st.markdown(f"### 📚 {st.session_state.selected_module['module']}")
+    st.markdown(f"**Coursework Type:** {st.session_state.selected_coursework['title']}")
+    st.markdown(f"**Programme:** {st.session_state.student_data['programme']}")
+    
+    # Coursework-specific examples
+    with st.expander("💡 Example Questions", expanded=False):
+        coursework_type = st.session_state.selected_coursework['type']
+        if coursework_type == 'assignment':
+            st.markdown("""
+            - "What are the key requirements for this assignment?"
+            - "How should I structure my report?"
+            - "What citation format should I use?"
+            - "What are the assessment criteria?"
+            """)
+        elif coursework_type == 'reading':
+            st.markdown("""
+            - "Can you summarize the main concepts in this module?"
+            - "What are the key theories I should understand?"
+            - "Which readings are most important for the exam?"
+            - "How do these concepts relate to practical applications?"
+            """)
+        elif coursework_type == 'concepts':
+            st.markdown("""
+            - "Can you explain [specific concept] in simple terms?"
+            - "How does [theory A] relate to [theory B]?"
+            - "What are some real-world examples of this concept?"
+            - "Why is this concept important in the field?"
+            """)
+        elif coursework_type == 'exam':
+            st.markdown("""
+            - "What topics are likely to be on the exam?"
+            - "How should I prepare for this type of assessment?"
+            - "Can you create practice questions for me?"
+            - "What are the key points I should remember?"
+            """)
+        else:
+            st.markdown("""
+            - "What are the learning objectives for this module?"
+            - "How can I improve my understanding of this subject?"
+            - "What additional resources do you recommend?"
+            - "How does this module connect to my overall programme?"
+            """)
+    
+    # Chat messages with audio support
+    for i, message in enumerate(st.session_state.messages):
+        message_key = f"msg_{i}_{message.get('timestamp', time.time())}"
+        
+        if message["role"] == "user":
+            st.markdown(f"""
+            <div style="background: #e3f2fd; color: #000; padding: 1rem; border-radius: 10px; margin: 1rem 0; border-left: 4px solid #2196f3;">
+                <strong>🙋 You:</strong><br>{message["content"]}
             </div>
             """, unsafe_allow_html=True)
         else:
-            # Display chat messages with audio
-            for i, message in enumerate(st.session_state.messages):
-                message_key = f"msg_{i}_{message.get('timestamp', time.time())}"
+            st.markdown(f"""
+            <div style="background: #f1f8e9; color: #000; padding: 1rem; border-radius: 10px; margin: 1rem 0; border-left: 4px solid #4caf50;">
+                <strong>🤖 Course Assistant:</strong><br>{message["content"]}
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Add audio player if audio is enabled
+            if st.session_state.get('audio_enabled', True):
+                # Check if we already have audio for this message
+                if message_key not in st.session_state.audio_responses:
+                    # Generate audio for this message
+                    with st.spinner(t('generating_audio', default='Generating audio...')):
+                        audio_bytes = generate_audio_response(
+                            message["content"], 
+                            st.session_state.get('selected_voice', Config.TTS_VOICE)
+                        )
+                        if audio_bytes:
+                            st.session_state.audio_responses[message_key] = audio_bytes
                 
-                if message["role"] == "user":
-                    st.markdown(f"""
-                    <div class="chat-message user-message">
-                        <div class="message-header">
-                            🙋 {t('you')}
-                        </div>
-                        <div class="message-content">{message["content"]}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                else:
-                    # AI response with audio
-                    st.markdown(f"""
-                    <div class="chat-message assistant-message">
-                        <div class="message-header">
-                            🤖 {t('ai_assistant')}
-                        </div>
-                        <div class="message-content">{message["content"]}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
-                    # Add audio player if audio is enabled
-                    if st.session_state.get('audio_enabled', True):
-                        # Check if we already have audio for this message
-                        if message_key not in st.session_state.audio_responses:
-                            # Generate audio for this message
-                            with st.spinner(t('generating_audio', default='Generating audio...')):
-                                audio_bytes = generate_audio_response(
-                                    message["content"], 
-                                    st.session_state.get('selected_voice', Config.TTS_VOICE)
-                                )
-                                if audio_bytes:
-                                    st.session_state.audio_responses[message_key] = audio_bytes
-                        
-                        # Display audio player if we have audio
-                        if message_key in st.session_state.audio_responses:
-                            audio_html = create_audio_player(
-                                st.session_state.audio_responses[message_key], 
-                                key=message_key
-                            )
-                            st.markdown(audio_html, unsafe_allow_html=True)
-
-def handle_user_input() -> None:
-    """Handle user input and generate AI responses with audio support and multi-language support"""
-    # Chat input with localized placeholder
-    if prompt := st.chat_input(t('search_placeholder')):
-        # Validate input
-        if not prompt.strip():
-            st.warning(f"⚠️ {t('enter_question')}")
-            return
-        
+                # Display audio player if we have audio
+                if message_key in st.session_state.audio_responses:
+                    audio_html = create_audio_player(
+                        st.session_state.audio_responses[message_key], 
+                        key=message_key
+                    )
+                    st.markdown(audio_html, unsafe_allow_html=True)
+    
+    # Chat input
+    if prompt := st.chat_input("Ask me about your coursework..."):
         # Add user message
         st.session_state.messages.append({
-            "role": "user", 
+            "role": "user",
             "content": prompt,
             "timestamp": time.time()
         })
         
-        # Generate AI response with loading indicator
-        with st.spinner(t('searching')):
-            response = search_documents(prompt, st.session_state.documents)
+        # Generate AI response for coursework
+        with st.spinner("Analyzing your coursework materials..."):
+            response = generate_ai_response(
+                prompt,
+                st.session_state.current_document['content'],
+                st.session_state.current_document['module']
+            )
         
         # Add AI response
         ai_message = {
-            "role": "assistant", 
+            "role": "assistant",
             "content": response,
             "timestamp": time.time()
         }
@@ -1396,34 +1108,641 @@ def handle_user_input() -> None:
             except Exception as e:
                 logger.error(f"Error pre-generating audio: {e}")
         
-        # Rerun to update the interface
         st.rerun()
+    
+    # Control buttons
+    col1, col2, col3 = st.columns([1, 1, 2])
+    
+    with col1:
+        if st.button("🔄 New Session", type="secondary"):
+            reset_conversation()
+            st.rerun()
+    
+    with col2:
+        if st.button("🔙 Change Module", type="secondary"):
+            st.session_state.conversation_step = 'module'
+            st.session_state.messages = []
+            st.session_state.current_document = None
+            st.rerun()
 
-def main() -> None:
-    """Main application function with proper error handling, audio support, and multi-language support"""
+def render_sidebar():
+    """Render sidebar with student info and controls"""
+    with st.sidebar:
+        # Language selector
+        st.markdown(f"### 🌐 {t('language_selector')}")
+        render_language_selector()
+        # Voice settings
+        render_voice_selector()
+        
+        st.markdown("---")
+        
+        # Student information (if authenticated)
+        if st.session_state.student_id and st.session_state.student_data:
+            st.markdown("### 👤 Student Information")
+            st.markdown(f"""
+            <div style="background: #f0f2f6; color: #000; padding: 1rem; border-radius: 8px;">
+                <p><strong>ID:</strong> {st.session_state.student_id}</p>
+                <p><strong>Programme:</strong> {st.session_state.student_data['programme']}</p>
+                <p><strong>Modules:</strong> {len(st.session_state.available_modules)}</p>
+            </div>
+            """, unsafe_allow_html=True)
+            st.markdown("---")
+        
+        # Current session info
+        if st.session_state.conversation_step != 'welcome':
+            st.markdown("### 📍 Current Session")
+            st.markdown(f"**Path:** {st.session_state.selected_path or 'Not selected'}")
+            
+            # ADD ETHICS-SPECIFIC INFO
+            if st.session_state.selected_path == 'ethics':
+                st.markdown("**Document:** Reforming Modernity")
+                if st.session_state.selected_ethics_category:
+                    st.markdown(f"**Category:** {st.session_state.selected_ethics_category['title']}")
+            elif st.session_state.selected_module:
+                st.markdown(f"**Module:** {st.session_state.selected_module['module']}")
+                if st.session_state.selected_coursework:
+                    st.markdown(f"**Type:** {st.session_state.selected_coursework['title']}")
+            
+            st.markdown("---")
+        
+        # Database status
+        st.markdown("### 📊 System Status")
+        if st.session_state.database_loaded:
+            st.success("✅ Database Connected")
+            total_students = len(st.session_state.student_database['students'])
+            total_programmes = len(st.session_state.student_database['programme_modules'])
+            st.markdown(f"**Students:** {total_students}")
+            st.markdown(f"**Programmes:** {total_programmes}")
+        else:
+            st.error("❌ Database Not Loaded")
+        
+        if OPENAI_API_KEY:
+            st.success("✅ AI Service Connected")
+        else:
+            st.error("❌ AI Service Not Available")
+        
+        st.markdown("---")
+        
+        # Quick actions
+        st.markdown("### ⚡ Quick Actions")
+        
+        if st.button("🏠 Start Over", use_container_width=True, type="secondary"):
+            reset_conversation()
+            st.rerun()
+        
+        if st.session_state.conversation_step == 'chat':
+            if st.button("🗑️ Clear Chat", use_container_width=True, type="secondary"):
+                st.session_state.messages = []
+                st.session_state.audio_responses = {}
+                st.rerun()
+
+def get_enhanced_css() -> str:    
+    """Get enhanced CSS with official Roehampton University brand colors"""
+    base_css = """
+    <style>
+        /* Import Google Fonts */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Arabic:wght@300;400;500;600;700&display=swap');
+        
+        /* Roehampton University Brand Colors */
+        :root {
+            --roehampton-green: #00A86B;        /* Primary Roehampton Green */
+            --roehampton-dark-green: #008756;   /* Darker shade for hover states */
+            --roehampton-light-green: #33BA85;  /* Lighter shade for accents */
+            --roehampton-navy: #1E3A5F;         /* Navy from logo text */
+            --roehampton-charcoal: #2C3E50;     /* Dark text color */
+            --success-color: #00A86B;           /* Use Roehampton green for success */
+            --primary-color: #00A86B;           /* Primary brand color */
+            --secondary-color: #1E3A5F;         /* Secondary navy color */
+            --error-color: #E74C3C;
+            --warning-color: #F39C12;
+            --info-color: #3498DB;
+            --background-light: #F8FFFE;        /* Very light green tint */
+            --background-white: #FFFFFF;
+            --text-primary: #2C3E50;
+            --text-secondary: #7F8C8D;
+            --border-color: #E8F5F0;            /* Light green border */
+            --shadow: 0 2px 4px rgba(0, 168, 107, 0.1);
+            --shadow-lg: 0 8px 25px rgba(0, 168, 107, 0.15);
+        }
+        
+        /* Global font with multi-language support */
+        .main, .sidebar .sidebar-content {
+            font-family: 'Inter', 'Noto Sans Arabic', 'Arial', sans-serif !important;
+            background-color: var(--background-light);
+        }
+        
+        /* Arabic text specific styling */
+        [lang="ar"], .arabic-text {
+            font-family: 'Noto Sans Arabic', 'Arial', 'Tahoma', sans-serif !important;
+            line-height: 1.8 !important;
+            text-align: right !important;
+        }
+        
+        /* Roehampton University Branded Header */
+        .roehampton-header {
+            background: linear-gradient(135deg, var(--roehampton-green), var(--roehampton-dark-green));
+            padding: 2.5rem 2rem;
+            border-radius: 15px;
+            margin-bottom: 2rem;
+            color: white;
+            text-align: center;
+            box-shadow: var(--shadow-lg);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .roehampton-header::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 70%);
+            animation: shimmer 3s infinite;
+        }
+        
+        @keyframes shimmer {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .logo-title-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 2rem;
+            margin-bottom: 1rem;
+            position: relative;
+            z-index: 1;
+        }
+        
+        .roehampton-logo {
+            height: 90px;
+            width: auto;
+            background: white;
+            padding: 0.75rem;
+            border-radius: 12px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+        }
+        
+        .roehampton-header h1 {
+            margin: 0;
+            font-weight: 700;
+            font-size: 2.8rem;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        
+        .roehampton-header p {
+            margin: 0;
+            opacity: 0.95;
+            font-size: 1.3rem;
+            font-weight: 400;
+        }
+        
+        /* Branded Buttons */
+        .stButton > button {
+            border-radius: 12px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            border: none;
+            font-size: 1.1rem;
+            padding: 0.8rem 1.5rem;
+        }
+        
+        .stButton > button[data-baseweb="button"][kind="primary"] {
+            background: linear-gradient(135deg, var(--roehampton-green), var(--roehampton-dark-green));
+            color: white;
+            box-shadow: var(--shadow);
+        }
+        
+        .stButton > button[data-baseweb="button"][kind="primary"]:hover {
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-lg);
+            background: linear-gradient(135deg, var(--roehampton-dark-green), var(--roehampton-green));
+        }
+        
+        .stButton > button[data-baseweb="button"][kind="secondary"] {
+            background: white;
+            color: var(--roehampton-green);
+            border: 2px solid var(--roehampton-green);
+        }
+        
+        .stButton > button[data-baseweb="button"][kind="secondary"]:hover {
+            background: var(--roehampton-green);
+            color: white;
+            transform: translateY(-1px);
+        }
+        
+        /* Chat message containers with Roehampton branding */
+        .chat-message {
+            padding: 1.5rem;
+            border-radius: 15px;
+            margin-bottom: 1.5rem;
+            box-shadow: var(--shadow);
+            transition: transform 0.2s ease;
+            border: 1px solid var(--border-color);
+        }
+        
+        .chat-message:hover {
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-lg);
+        }
+        
+        .user-message {
+            background: linear-gradient(135deg, #E8F8F5, #D5F4E6);
+            border-left: 4px solid var(--roehampton-green);
+            margin-left: 2rem;
+        }
+        
+        .assistant-message {
+            background: linear-gradient(135deg, #F8FFFE, #F0FDF9);
+            border-left: 4px solid var(--roehampton-light-green);
+            margin-right: 2rem;
+        }
+        
+        .ethics-message {
+            background: linear-gradient(135deg, #F0F4F8, #E2E8F0);
+            border-left: 4px solid var(--roehampton-navy);
+            margin-right: 2rem;
+        }
+        
+        .message-header {
+            font-weight: 600;
+            margin-bottom: 0.75rem;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 1rem;
+        }
+        
+        .message-content {
+            color: var(--text-primary);
+            line-height: 1.7;
+            font-size: 1rem;
+        }
+        
+        /* Progress indicator with Roehampton colors */
+        .stProgress > div > div > div {
+            background: linear-gradient(90deg, var(--roehampton-green), var(--roehampton-light-green));
+        }
+        
+        /* Input styling with Roehampton theme */
+        .stTextInput > div > div > input {
+            border-radius: 10px;
+            border: 2px solid var(--border-color);
+            padding: 0.75rem 1rem;
+            font-size: 1rem;
+            transition: all 0.2s ease;
+        }
+        
+        .stTextInput > div > div > input:focus {
+            border-color: var(--roehampton-green);
+            box-shadow: 0 0 0 3px rgba(0, 168, 107, 0.1);
+        }
+        
+        /* Audio player with Roehampton branding */
+        .audio-player-container {
+            margin: 15px 0;
+            padding: 0;
+        }
+        
+        .audio-controls {
+            background: linear-gradient(135deg, var(--roehampton-green), var(--roehampton-dark-green));
+            border-radius: 25px;
+            padding: 12px 20px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            box-shadow: var(--shadow-lg);
+            transition: all 0.3s ease;
+        }
+        
+        .audio-controls:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 25px rgba(0, 168, 107, 0.3);
+        }
+        
+        .audio-controls audio {
+            height: 35px;
+            border-radius: 17px;
+            outline: none;
+            flex: 1;
+            min-width: 200px;
+            background: rgba(255,255,255,0.2);
+        }
+        
+        /* Sidebar styling with Roehampton theme */
+        .sidebar-section {
+            background: var(--background-white);
+            padding: 1.5rem;
+            border-radius: 12px;
+            margin-bottom: 1rem;
+            border: 1px solid var(--border-color);
+            box-shadow: var(--shadow);
+        }
+        
+        .sidebar-section h3 {
+            color: var(--roehampton-green);
+            margin-top: 0;
+        }
+        
+        .info-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.75rem 0;
+            border-bottom: 1px solid var(--border-color);
+        }
+        
+        .info-item:last-child {
+            border-bottom: none;
+        }
+        
+        .info-label {
+            font-weight: 500;
+            color: var(--text-secondary);
+            font-size: 0.95rem;
+        }
+        
+        .info-value {
+            font-weight: 600;
+            color: var(--roehampton-green);
+            font-size: 0.95rem;
+        }
+        
+        /* Status indicators with Roehampton branding */
+        .status-success {
+            background: linear-gradient(135deg, var(--roehampton-green), var(--roehampton-dark-green));
+            color: white;
+            padding: 0.6rem 1.2rem;
+            border-radius: 25px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            box-shadow: var(--shadow);
+        }
+        
+        .status-error {
+            background: linear-gradient(135deg, var(--error-color), #C0392B);
+            color: white;
+            padding: 0.6rem 1.2rem;
+            border-radius: 25px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .status-info {
+            background: linear-gradient(135deg, var(--roehampton-navy), #34495E);
+            color: white;
+            padding: 0.6rem 1.2rem;
+            border-radius: 25px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        /* Module cards with Roehampton styling */
+        .module-card {
+            border: 2px solid var(--border-color);
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+            background: var(--background-white);
+            transition: all 0.3s ease;
+        }
+        
+        .module-card:hover {
+            border-color: var(--roehampton-green);
+            box-shadow: var(--shadow-lg);
+            transform: translateY(-2px);
+        }
+        
+        /* Welcome page features */
+        .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1.5rem;
+            margin: 2rem 0;
+        }
+        
+        .feature-card {
+            background: var(--background-white);
+            padding: 1.5rem;
+            border-radius: 12px;
+            border: 1px solid var(--border-color);
+            box-shadow: var(--shadow);
+            transition: all 0.3s ease;
+        }
+        
+        .feature-card:hover {
+            transform: translateY(-3px);
+            box-shadow: var(--shadow-lg);
+            border-color: var(--roehampton-light-green);
+        }
+        
+        .feature-icon {
+            font-size: 2.5rem;
+            margin-bottom: 1rem;
+            text-align: center;
+        }
+        
+        .feature-title {
+            font-size: 1.2rem;
+            font-weight: 600;
+            color: var(--roehampton-green);
+            margin-bottom: 0.5rem;
+            text-align: center;
+        }
+        
+        .feature-description {
+            color: var(--text-secondary);
+            text-align: center;
+            line-height: 1.5;
+        }
+        
+        /* Responsive design */
+        @media (max-width: 768px) {
+            .roehampton-header h1 {
+                font-size: 2rem;
+            }
+            
+            .logo-title-container {
+                flex-direction: column;
+                gap: 1rem;
+            }
+            
+            .roehampton-logo {
+                height: 70px;
+            }
+            
+            .chat-message {
+                margin-left: 0.5rem;
+                margin-right: 0.5rem;
+                padding: 1rem;
+            }
+            
+            .user-message, .assistant-message, .ethics-message {
+                margin-left: 0;
+                margin-right: 0;
+            }
+        }
+        
+        /* Loading animation with Roehampton colors */
+        .loading-spinner {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 2px solid var(--border-color);
+            border-radius: 50%;
+            border-top-color: var(--roehampton-green);
+            animation: spin 1s ease-in-out infinite;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        /* Streamlit specific overrides */
+        .stAlert {
+            border-radius: 12px;
+            border: none;
+            font-weight: 500;
+        }
+        
+        .stExpander {
+            border-radius: 10px;
+            border: 1px solid var(--border-color);
+        }
+        
+        .stSelectbox > div > div {
+            border-radius: 8px;
+            border-color: var(--border-color);
+        }
+        
+        /* Custom checkbox styling */
+        .stCheckbox > label {
+            color: var(--text-primary);
+        }
+        
+        .stCheckbox > label > div {
+            background-color: var(--roehampton-green);
+        }
+    </style>
+    """
+    
+    # Add RTL-specific CSS if needed
+    from localization import get_rtl_css
+    rtl_css = get_rtl_css()
+    
+    return base_css + rtl_css
+def main():
+    """Main application function with guided conversation flow"""
     try:
-        # Initialize session state and language system
+        # Initialize session state
         initialize_session_state()
         
         # Create audio folder
         create_audio_folder()
         
-        # Apply enhanced CSS with RTL support and audio styling
+        # Apply enhanced CSS
         st.markdown(get_enhanced_css(), unsafe_allow_html=True)
         
-        # Render sidebar with voice settings
+        # Load student database if not loaded
+        if not st.session_state.database_loaded:
+            with st.spinner("Loading student database..."):
+                database, message = load_student_database()
+                if database:
+                    st.session_state.student_database = database
+                    st.session_state.database_loaded = True
+                    logger.info("Student database loaded successfully")
+                else:
+                    st.error(f"Failed to load student database: {message}")
+                    st.stop()
+        
+        # Render sidebar
         render_sidebar()
         
-        # Render main chat interface with audio support
-        render_chat_interface()
+        # Render progress indicator (except for welcome screen)
+        if st.session_state.conversation_step != 'welcome':
+            render_progress_indicator()
+            st.markdown("---")
         
-        # Handle user input with audio generation
-        handle_user_input()
+        # Render appropriate screen based on conversation step
+        if st.session_state.conversation_step == 'welcome':
+            render_welcome_screen()
         
+        elif st.session_state.conversation_step == 'student_id':
+            render_student_id_input()
+        
+        elif st.session_state.conversation_step == 'code':
+            render_code_input()
+        
+        elif st.session_state.conversation_step == 'module':
+            render_module_selection()
+        
+        elif st.session_state.conversation_step == 'coursework':
+            render_coursework_selection()
+        
+        elif st.session_state.conversation_step == 'ethics_selection':
+            if ETHICS_AVAILABLE:
+                render_ethics_chat_interface()
+            else:
+                st.error("Ethics assistance is not available. Please ensure ethics_handler.py is properly configured.")
+                if st.button("🔙 Back"):
+                    st.session_state.conversation_step = 'welcome'
+                    st.rerun()
+        
+        elif st.session_state.conversation_step == 'ethics_chat':
+            if ETHICS_AVAILABLE:
+                render_ethics_chat_interface()
+            else:
+                st.error("Ethics assistance is not available. Please ensure ethics_handler.py is properly configured.")
+                if st.button("🔙 Back"):
+                    st.session_state.conversation_step = 'welcome'
+                    st.rerun()
+        
+        elif st.session_state.conversation_step == 'chat':
+            render_chat_interface()
+        
+        else:
+            st.error("Unknown conversation step. Please restart.")
+            if st.button("🔄 Restart"):
+                reset_conversation()
+                st.rerun()
+    
     except Exception as e:
         logger.error(f"Application error: {e}")
-        st.error(f"🚨 **{t('app_error', error=str(e))}**")
-        st.info(t('refresh_page'))
+        st.error(f"🚨 **Application Error**: {str(e)}")
+        
+        # Show detailed error information for debugging
+        if st.checkbox("Show detailed error information (for debugging)"):
+            import traceback
+            st.code(traceback.format_exc())
+        
+        st.info("Please try the following:")
+        st.markdown("""
+        1. **Refresh the page** and try again
+        2. **Check your .env file** - ensure OPENAI_API_KEY is set
+        3. **Verify your Excel file** - ensure student_modules_with_pdfs.xlsx exists
+        4. **Check file permissions** - ensure the app can read your files
+        5. **Restart the application** if the problem persists
+        """)
+        
+        if st.button("🔄 Reset Application"):
+            # Clear all session state
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
 
 if __name__ == '__main__':
     main()

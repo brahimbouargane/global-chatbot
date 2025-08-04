@@ -165,9 +165,39 @@ def initialize_session_state() -> None:
     # Initialize language system
     init_language_system()
 
+def extract_coursework_type_from_filename(pdf_filename: str) -> str:
+    """Extract coursework type from PDF filename"""
+    filename_lower = pdf_filename.lower()
+    
+    # Machine Learning specific patterns
+    if 'coursework1' in filename_lower:
+        return 'Coursework 1'
+    elif 'coursework2' in filename_lower:
+        return 'Coursework 2'
+    elif 'coursework3' in filename_lower:
+        return 'Coursework 3'
+    elif 'assignment1' in filename_lower:
+        return 'Assignment 1'
+    elif 'assignment2' in filename_lower:
+        return 'Assignment 2'
+    elif 'assignment3' in filename_lower:
+        return 'Assignment 3'
+    else:
+        return 'Course Materials'
+    
+def format_pdf_display_name(pdf_filename: str) -> str:
+    """Create user-friendly display name from PDF filename"""
+    # Remove extension and replace underscores
+    name = Path(pdf_filename).stem.replace('_', ' ')
+    
+    # Capitalize each word
+    name = ' '.join(word.capitalize() for word in name.split())
+    
+    return name
+
 @st.cache_data(show_spinner=False)
 def load_student_database() -> Tuple[Optional[Dict], str]:
-    """Load student database from Excel file"""
+    """Load student database from Excel file with support for multiple PDFs per module"""
     try:
         excel_path = Path(Config.STUDENT_DATA_FILE)
         if not excel_path.exists():
@@ -182,12 +212,12 @@ def load_student_database() -> Tuple[Optional[Dict], str]:
         if missing_columns:
             return None, f"Missing required columns in Excel file: {missing_columns}"
         
-        # Create data structures
+        # Create enhanced data structures to handle multiple PDFs per module
         student_database = {
             'students': {},  # student_id -> {code, programme, modules}
             'student_codes': {},  # student_id -> code
-            'student_modules': {},  # student_id -> [modules]
-            'programme_modules': {}  # programme -> [modules]
+            'student_modules': {},  # student_id -> {module_name: [pdf_files]}
+            'programme_modules': {}  # programme -> {module_name: [pdf_files]}
         }
         
         for _, row in df.iterrows():
@@ -202,31 +232,45 @@ def load_student_database() -> Tuple[Optional[Dict], str]:
                 student_database['students'][student_id] = {
                     'code': code,
                     'programme': programme,
-                    'modules': []
+                    'modules': {}
                 }
                 student_database['student_codes'][student_id] = code
-                student_database['student_modules'][student_id] = []
+                student_database['student_modules'][student_id] = {}
             
-            # Add module
-            module_data = {
-                'module': module,
+            # Initialize module if not exists for this student
+            if module not in student_database['student_modules'][student_id]:
+                student_database['student_modules'][student_id][module] = []
+            
+            # Create PDF data with enhanced info for Machine Learning
+            pdf_data = {
+                'pdf_file': pdf_file,
                 'programme': programme,
-                'pdf_file': pdf_file
+                'coursework_type': extract_coursework_type_from_filename(pdf_file),
+                'display_name': format_pdf_display_name(pdf_file)
             }
-            student_database['student_modules'][student_id].append(module_data)
-            student_database['students'][student_id]['modules'].append(module_data)
+            
+            student_database['student_modules'][student_id][module].append(pdf_data)
+            student_database['students'][student_id]['modules'][module] = student_database['student_modules'][student_id][module]
             
             # Add to programme modules
             if programme not in student_database['programme_modules']:
-                student_database['programme_modules'][programme] = []
+                student_database['programme_modules'][programme] = {}
             
-            if not any(m['module'] == module for m in student_database['programme_modules'][programme]):
-                student_database['programme_modules'][programme].append({
-                    'module': module,
-                    'pdf_file': pdf_file
-                })
+            if module not in student_database['programme_modules'][programme]:
+                student_database['programme_modules'][programme][module] = []
+            
+            # Check if this PDF is already in the programme module list
+            if not any(p['pdf_file'] == pdf_file for p in student_database['programme_modules'][programme][module]):
+                student_database['programme_modules'][programme][module].append(pdf_data)
         
         logger.info(f"Loaded {len(student_database['students'])} students from database")
+        
+        # Log modules with multiple PDFs
+        for student_id, modules in student_database['student_modules'].items():
+            for module_name, pdfs in modules.items():
+                if len(pdfs) > 1:
+                    logger.info(f"Student {student_id}, Module '{module_name}' has {len(pdfs)} PDFs: {[p['pdf_file'] for p in pdfs]}")
+        
         return student_database, "Database loaded successfully"
         
     except Exception as e:
@@ -538,27 +582,74 @@ def read_docx(file_path: Path) -> Tuple[Optional[str], Dict[str, Any]]:
         return None, {'error': str(e)}
 
 def load_document_for_module(module_data: Dict) -> Tuple[Optional[str], Dict[str, Any], str]:
-    """Load the PDF document for a specific module"""
+    """Enhanced document loading with support for multiple PDFs"""
     try:
-        pdf_filename = module_data['pdf_file']
-        pdf_path = Path(Config.DATA_FOLDER) / pdf_filename
+        combined_content = ""
+        combined_metadata = {}
+        loaded_files = []
         
-        if not pdf_path.exists():
-            return None, {}, f"Document not found: {pdf_filename}"
-        
-        content, metadata = read_document(pdf_path)
-        
-        if content:
-            return content, metadata, f"Loaded {pdf_filename} successfully"
-        else:
-            return None, metadata, f"Failed to extract content from {pdf_filename}"
+        if module_data['pdf_file'] == 'multiple':
+            # Load all PDFs for this module
+            total_pages = 0
+            total_words = 0
+            total_size = 0
             
+            for pdf_data in module_data['all_pdfs']:
+                pdf_filename = pdf_data['pdf_file']
+                pdf_path = Path(Config.DATA_FOLDER) / pdf_filename
+                
+                if pdf_path.exists():
+                    content, metadata = read_document(pdf_path)
+                    if content:
+                        # Add section header for each document
+                        section_header = f"\n\n{'='*60}\n📄 {pdf_data['display_name']} ({pdf_data['coursework_type']})\nFile: {pdf_data['pdf_file']}\n{'='*60}\n"
+                        combined_content += section_header + content
+                        
+                        # Aggregate metadata
+                        total_pages += metadata.get('total_pages', 0)
+                        total_words += metadata.get('word_count', 0)
+                        total_size += metadata.get('file_size', 0)
+                        loaded_files.append(pdf_filename)
+                    else:
+                        logger.warning(f"Failed to load content from {pdf_filename}")
+                else:
+                    logger.warning(f"File not found: {pdf_filename}")
+            
+            combined_metadata = {
+                'total_pages': total_pages,
+                'total_words': total_words,
+                'total_size': total_size,
+                'loaded_files': loaded_files,
+                'file_count': len(loaded_files),
+                'file_type': 'Multiple Documents'
+            }
+            
+            if combined_content:
+                return combined_content, combined_metadata, f"Loaded {len(loaded_files)} documents for {module_data['module']}"
+            else:
+                return None, combined_metadata, f"No content could be loaded for {module_data['module']}"
+        
+        else:
+            # Load single PDF
+            pdf_filename = module_data['pdf_file']
+            pdf_path = Path(Config.DATA_FOLDER) / pdf_filename
+            
+            if not pdf_path.exists():
+                return None, {}, f"Document not found: {pdf_filename}"
+            
+            content, metadata = read_document(pdf_path)
+            
+            if content:
+                return content, metadata, f"Loaded {pdf_filename} successfully"
+            else:
+                return None, metadata, f"Failed to extract content from {pdf_filename}"
+                
     except Exception as e:
         logger.error(f"Error loading document for module: {e}")
         return None, {}, f"Error: {str(e)}"
 
 def generate_ai_response(question: str, document_content: str, module_info: Dict) -> str:
-    """Generate AI response based on document content and module context"""
+    """Enhanced AI response generation with support for multiple documents"""
     if not client:
         return f"🔑 **{t('api_key_missing')}**"
     
@@ -566,17 +657,29 @@ def generate_ai_response(question: str, document_content: str, module_info: Dict
         return f"📄 **No document content available for {module_info['module']}**"
     
     try:
-        # Create context-aware prompt
+        # Create enhanced context-aware prompt
+        document_info = ""
+        if module_info['pdf_file'] == 'multiple':
+            document_info = f"Multiple documents loaded for {module_info['module']}:\n"
+            for pdf_data in module_info['all_pdfs']:
+                document_info += f"- {pdf_data['display_name']} ({pdf_data['coursework_type']}) - File: {pdf_data['pdf_file']}\n"
+        else:
+            document_info = f"Document: {module_info['display_name']} ({module_info['coursework_type']}) - File: {module_info['pdf_file']}"
+        
         system_prompt = f"""You are an expert academic assistant for University of Roehampton students. You are helping with the module: "{module_info['module']}" from the {module_info['programme']} programme.
+
+{document_info}
 
 DOCUMENT CONTENT:
 {document_content[:Config.MAX_CONTENT_LENGTH]}
 
 INSTRUCTIONS:
 - Answer questions based ONLY on the provided document content
+- If multiple documents are provided, clearly indicate which document contains specific information using the format **[Source: Document Name]**
+- When referencing content, use the file names shown above for clarity
 - Be helpful and educational, explaining concepts clearly
-- If information isn't in the document, say so clearly
-- Provide specific references to sections of the document when possible
+- If information isn't in the document(s), say so clearly
+- Provide specific references to sections when possible
 - Help with coursework understanding, but don't do the work for the student
 - Encourage critical thinking and learning
 - Be supportive and encouraging
@@ -584,9 +687,9 @@ INSTRUCTIONS:
 CONTEXT:
 - Module: {module_info['module']}
 - Programme: {module_info['programme']}
-- Document: {module_info['pdf_file']}
+- Materials: {module_info['coursework_type']}
 
-Remember: You are helping a Roehampton University student understand their coursework materials."""
+Remember: You are helping a Roehampton University student understand their coursework materials. Always cite your sources when multiple documents are available."""
 
         response = client.chat.completions.create(
             model=Config.MODEL,
@@ -871,40 +974,411 @@ def render_code_input():
                     st.rerun()
                 
 
-def render_module_selection():
-    """Render module selection screen"""
-    st.markdown(f"### 📚 Step 4: Select Your Module")
-    st.markdown(f"Welcome, **{st.session_state.student_id}**!")
-    st.markdown(f"Programme: **{st.session_state.student_data['programme']}**")
-    st.markdown("Please select the module you need help with:")
+def get_module_selection_css():
+    """Additional CSS for the redesigned module selection"""
+    return """
+    <style>
+    /* Module Selection Specific Styles */
+    .module-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+        gap: 1.5rem;
+        margin: 2rem 0;
+    }
     
-    if not st.session_state.available_modules:
-        st.error("No modules found for your account. Please contact support.")
+    .module-card {
+        background: linear-gradient(145deg, #ffffff, #f8fffe);
+        border: 2px solid #e8f5f0;
+        border-radius: 16px;
+        padding: 0;
+        transition: all 0.3s ease;
+        box-shadow: 0 4px 12px rgba(0, 168, 107, 0.1);
+        overflow: hidden;
+        position: relative;
+    }
+    
+    .module-card:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 8px 25px rgba(0, 168, 107, 0.2);
+        border-color: #00a86b;
+    }
+    
+    .module-card-header {
+        background: linear-gradient(135deg, #00a86b, #008756);
+        color: white;
+        padding: 1.5rem;
+        position: relative;
+        overflow: hidden;
+    }
+    
+    .module-card-header::before {
+        content: '';
+        position: absolute;
+        top: -50%;
+        right: -50%;
+        width: 100px;
+        height: 100px;
+        background: radial-gradient(circle, rgba(255,255,255,0.2) 0%, transparent 70%);
+        border-radius: 50%;
+    }
+    
+    .module-title {
+        font-size: 1.4rem;
+        font-weight: 700;
+        margin: 0 0 0.5rem 0;
+        position: relative;
+        z-index: 1;
+    }
+    
+    .module-subtitle {
+        font-size: 0.95rem;
+        opacity: 0.9;
+        margin: 0;
+        position: relative;
+        z-index: 1;
+    }
+    
+    .module-card-body {
+        padding: 1.5rem;
+    }
+    
+    .pdf-list {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+    }
+    
+    .pdf-item {
+        background: #f8fffe;
+        border: 1px solid #e8f5f0;
+        border-radius: 10px;
+        padding: 1rem;
+        margin-bottom: 1rem;
+        transition: all 0.2s ease;
+        position: relative;
+    }
+    
+    .pdf-item:hover {
+        background: #f0fdf9;
+        border-color: #00a86b;
+        transform: translateX(5px);
+    }
+    
+    .pdf-name {
+        font-weight: 600;
+        color: #00a86b;
+        margin: 0 0 0.25rem 0;
+        font-size: 1.05rem;
+    }
+    
+    .pdf-meta {
+        font-size: 0.85rem;
+        color: #666;
+        margin: 0;
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+    }
+    
+    .pdf-badge {
+        background: linear-gradient(135deg, #00a86b, #008756);
+        color: white;
+        padding: 0.25rem 0.75rem;
+        border-radius: 15px;
+        font-size: 0.8rem;
+        font-weight: 500;
+    }
+    
+    .select-all-option {
+        background: linear-gradient(135deg, #f0fdf9, #e8f5f0);
+        border: 2px dashed #00a86b;
+        border-radius: 12px;
+        padding: 1.25rem;
+        margin-top: 1rem;
+        text-align: center;
+        transition: all 0.3s ease;
+    }
+    
+    .select-all-option:hover {
+        background: linear-gradient(135deg, #e8f5f0, #d5f4e6);
+        border-style: solid;
+    }
+    
+    .select-all-title {
+        font-weight: 600;
+        color: #00a86b;
+        margin: 0 0 0.5rem 0;
+        font-size: 1.1rem;
+    }
+    
+    .select-all-desc {
+        color: #666;
+        margin: 0;
+        font-size: 0.9rem;
+    }
+    
+    .action-buttons {
+        display: flex;
+        gap: 0.75rem;
+        margin-top: 1rem;
+        flex-wrap: wrap;
+    }
+    
+    .btn-select {
+        background: linear-gradient(135deg, #00a86b, #008756);
+        color: white;
+        border: none;
+        padding: 0.6rem 1.2rem;
+        border-radius: 8px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        font-size: 0.9rem;
+        flex: 1;
+        min-width: 100px;
+    }
+    
+    .btn-select:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(0, 168, 107, 0.3);
+    }
+    
+    .btn-select-all {
+        background: linear-gradient(135deg, #1e3a5f, #2c3e50);
+        color: white;
+        border: none;
+        padding: 0.6rem 1.2rem;
+        border-radius: 8px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        font-size: 0.9rem;
+        width: 100%;
+    }
+    
+    .btn-select-all:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(30, 58, 95, 0.3);
+    }
+    
+    .single-module-card {
+        background: linear-gradient(145deg, #ffffff, #f8fffe);
+        border: 2px solid #e8f5f0;
+        border-radius: 16px;
+        padding: 0;
+        transition: all 0.3s ease;
+        box-shadow: 0 4px 12px rgba(0, 168, 107, 0.1);
+        overflow: hidden;
+        margin-bottom: 1.5rem;
+    }
+    
+    .single-module-card:hover {
+        transform: translateY(-3px);
+        box-shadow: 0 8px 25px rgba(0, 168, 107, 0.2);
+        border-color: #00a86b;
+    }
+    
+    .progress-header {
+        background: linear-gradient(135deg, #f8fffe, #f0fdf9);
+        padding: 1.5rem;
+        border-radius: 12px;
+        margin-bottom: 2rem;
+        border: 1px solid #e8f5f0;
+    }
+    
+    .progress-title {
+        color: #00a86b;
+        font-size: 1.8rem;
+        font-weight: 700;
+        margin: 0 0 0.5rem 0;
+    }
+    
+    .progress-subtitle {
+        color: #666;
+        margin: 0 0 1rem 0;
+        font-size: 1.05rem;
+    }
+    
+    .student-info {
+        display: flex;
+        gap: 2rem;
+        flex-wrap: wrap;
+        align-items: center;
+    }
+    
+    .info-badge {
+        background: #00a86b;
+        color: white;
+        padding: 0.5rem 1rem;
+        border-radius: 20px;
+        font-weight: 600;
+        font-size: 0.9rem;
+    }
+    
+    /* Responsive Design */
+    @media (max-width: 768px) {
+        .module-grid {
+            grid-template-columns: 1fr;
+            gap: 1rem;
+        }
+        
+        .student-info {
+            flex-direction: column;
+            gap: 1rem;
+            align-items: flex-start;
+        }
+        
+        .action-buttons {
+            flex-direction: column;
+        }
+        
+        .btn-select {
+            flex: none;
+            width: 100%;
+        }
+    }
+    
+    /* Animation for card entrance */
+    @keyframes slideInUp {
+        from {
+            transform: translateY(30px);
+            opacity: 0;
+        }
+        to {
+            transform: translateY(0);
+            opacity: 1;
+        }
+    }
+    
+    .module-card, .single-module-card {
+        animation: slideInUp 0.5s ease forwards;
+    }
+    
+    .module-card:nth-child(2) { animation-delay: 0.1s; }
+    .module-card:nth-child(3) { animation-delay: 0.2s; }
+    .module-card:nth-child(4) { animation-delay: 0.3s; }
+    </style>
+    """
+
+def render_module_selection():
+    """Redesigned module selection screen with modern card-based interface"""
+    
+    # Add module-specific CSS
+    st.markdown(get_module_selection_css(), unsafe_allow_html=True)
+    
+    # Progress header
+    st.markdown(f"""
+    <div class="progress-header">
+        <div class="progress-title">📚 Select Your Module</div>
+        <div class="progress-subtitle">Choose the module you need assistance with</div>
+        <div class="student-info">
+            <div class="info-badge">👤 {st.session_state.student_id}</div>
+            <div class="info-badge">🎓 {st.session_state.student_data['programme']}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Get modules from the database
+    student_modules = st.session_state.student_database['student_modules'][st.session_state.student_id]
+    
+    if not student_modules:
+        st.error("❌ No modules found for your account. Please contact support.")
         return
     
-    # Display modules as cards
-    for i, module in enumerate(st.session_state.available_modules):
-        with st.container():
-            col1, col2 = st.columns([3, 1])
+    # Create module cards
+    modules_html = '<div class="module-grid">'
+    
+   
+    
+    modules_html += '</div>'
+    
+    # Display the HTML
+    st.markdown(modules_html, unsafe_allow_html=True)
+    
+    # Now add the actual Streamlit buttons
+    st.markdown("### Select Your Module:")
+    
+    for module_name, pdfs in student_modules.items():
+        if len(pdfs) > 1:
+            # Multi-PDF module buttons
+            st.markdown(f"**📖 {module_name}** ({len(pdfs)} documents)")
             
-            with col1:
-                st.markdown(f"""
-                <div style="padding: 1rem; border: 1px solid #ddd; border-radius: 8px; margin-bottom: 1rem;">
-                    <h4 style="margin: 0 0 0.5rem 0;">{module['module']}</h4>
-                    <p style="margin: 0; color: #666;">PDF: {module['pdf_file']}</p>
-                </div>
-                """, unsafe_allow_html=True)
+            # Individual PDF buttons
+            cols = st.columns(len(pdfs))
+            for i, pdf_data in enumerate(pdfs):
+                with cols[i]:
+                    if st.button(
+                        f"📄 {pdf_data['coursework_type']}", 
+                        key=f"{module_name}_pdf_{i}_{pdf_data['pdf_file']}", 
+                        help=f"Select {pdf_data['display_name']}",
+                        use_container_width=True
+                    ):
+                        st.session_state.selected_module = {
+                            'module': module_name,
+                            'programme': pdf_data['programme'],
+                            'pdf_file': pdf_data['pdf_file'],
+                            'coursework_type': pdf_data['coursework_type'],
+                            'display_name': pdf_data['display_name'],
+                            'is_multi_pdf': True,
+                            'all_pdfs': pdfs
+                        }
+                        st.session_state.conversation_step = 'coursework'
+                        st.rerun()
             
-            with col2:
-                if st.button("Select", 
-                            key=f"module_select_{i}",  # ← ADD THIS KEY
-                            type="primary"):
-                    st.session_state.selected_module = module
-                    st.session_state.conversation_step = 'coursework'
-                    st.rerun()
+            # Select all button
+            if st.button(
+                f"📚 All {module_name} Materials", 
+                key=f"{module_name}_all_pdfs",
+                help=f"Load all {len(pdfs)} documents together",
+                type="secondary",
+                use_container_width=True
+            ):
+                st.session_state.selected_module = {
+                    'module': module_name,
+                    'programme': pdfs[0]['programme'],
+                    'pdf_file': 'multiple',
+                    'coursework_type': 'All Materials',
+                    'display_name': f"All {module_name} Materials",
+                    'is_multi_pdf': True,
+                    'all_pdfs': pdfs
+                }
+                st.session_state.conversation_step = 'coursework'
+                st.rerun()
+            
+            st.markdown("---")
+        
+        else:
+            # Single PDF module button
+            pdf_data = pdfs[0]
+            st.markdown(f"**📖 {module_name}**")
+            
+            if st.button(
+                f"Select {module_name}", 
+                key=f"{module_name}_single",
+                help=f"Access {pdf_data['pdf_file']}",
+                use_container_width=True,
+                type="primary"
+            ):
+                st.session_state.selected_module = {
+                    'module': module_name,
+                    'programme': pdf_data['programme'],
+                    'pdf_file': pdf_data['pdf_file'],
+                    'coursework_type': pdf_data.get('coursework_type', 'Course Materials'),
+                    'display_name': pdf_data.get('display_name', module_name),
+                    'is_multi_pdf': False,
+                    'all_pdfs': pdfs
+                }
+                st.session_state.conversation_step = 'coursework'
+                st.rerun()
+            
+            st.markdown("---")
     
     # Back button
-    if st.button("🔙 Back to Code", type="secondary"):
+    st.markdown("### Navigation")
+    if st.button("🔙 Back to Authentication", 
+                type="secondary",
+                key="module_back_btn",
+                use_container_width=True):
         st.session_state.conversation_step = 'code'
         st.rerun()
 
@@ -1645,6 +2119,7 @@ def get_enhanced_css() -> str:
     rtl_css = get_rtl_css()
     
     return base_css + rtl_css
+
 def main():
     """Main application function with guided conversation flow"""
     try:

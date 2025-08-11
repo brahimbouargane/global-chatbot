@@ -28,9 +28,9 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
-# Configuration - Simplified for ethics only
+# Configuration - Updated for multiple ethics PDFs
 class Config:
-    PROJECT_NAME = "Ethics Assistant"
+    PROJECT_NAME = "Comprehensive Ethics Assistant"
     COMPANY_NAME = "Ethics Center"
     LOGO_PATH = "logo.png"
     MAX_TOKENS = 1500
@@ -46,6 +46,12 @@ class Config:
         'nova': 'Nova (Female)',
         'shimmer': 'Shimmer (Soft Female)'
     }
+    # Multiple ethics PDFs configuration
+    ETHICS_PDF_FILES = [
+        "Islamic_Ethics.pdf",
+        "Islamic_Ethics2.pdf", 
+        "reforming_modernity.pdf"
+    ]
 
 # Initialize OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -89,7 +95,7 @@ st.set_page_config(
     menu_items={
         'Get Help': None,
         'Report a bug': None,
-        'About': f"# {Config.PROJECT_NAME}\nEthics guidance assistant for decision-making"
+        'About': f"# {Config.PROJECT_NAME}\nComprehensive ethics guidance from Islamic and contemporary perspectives"
     }
 )
 
@@ -108,7 +114,7 @@ def initialize_session_state() -> None:
         st.session_state.student_id = "ETHICS_USER"
     if 'student_data' not in st.session_state:
         st.session_state.student_data = {
-            'programme': 'Ethics Assistant',
+            'programme': 'Comprehensive Ethics Assistant',
             'code': 'ETHICS'
         }
     
@@ -319,40 +325,68 @@ def render_sidebar():
         
         st.markdown("---")
         
-        # System status
-        # st.markdown("📊 System Status")
+        # System status - Updated for file selector
+        st.markdown("📊 System Status")
         
-        # if ETHICS_AVAILABLE:
-        #     st.success("✅ Ethics System Available")
-        # else:
-        #     st.error("❌ Ethics System Not Available")
+        if ETHICS_AVAILABLE:
+            st.success("✅ Ethics System with File Selection Available")
+            
+            # Show which PDFs are available
+            from pathlib import Path
+            from ethics_handler import get_available_pdfs, EthicsConfig
+            
+            data_folder = Path("data")
+            available_pdfs = get_available_pdfs()
+            
+            if available_pdfs:
+                st.success(f"✅ Available Documents: {len(available_pdfs)}/{len(EthicsConfig.ETHICS_PDF_FILES)}")
+                for pdf in available_pdfs:
+                    display_name = EthicsConfig.PDF_DISPLAY_NAMES.get(pdf, pdf)
+                    st.write(f"   {display_name}")
+            
+            missing_pdfs = [pdf for pdf in EthicsConfig.ETHICS_PDF_FILES if pdf not in available_pdfs]
+            if missing_pdfs:
+                st.warning(f"⚠️ Missing Documents: {len(missing_pdfs)}")
+                for pdf in missing_pdfs:
+                    display_name = EthicsConfig.PDF_DISPLAY_NAMES.get(pdf, pdf)
+                    st.write(f"   ❌ {display_name}")
+        else:
+            st.error("❌ Ethics System Not Available")
         
-        # if OPENAI_API_KEY:
-        #     st.success("✅ AI Service Connected")
-        # else:
-        #     st.error("❌ AI Service Not Available")
+        if OPENAI_API_KEY:
+            st.success("✅ AI Service Connected")
+        else:
+            st.error("❌ AI Service Not Available")
         
-        # st.markdown("---")
+        st.markdown("---")
+        
+        # File selection info
+        if ETHICS_AVAILABLE:
+            st.markdown("📁 Document Selection")
+            st.info(t('file_selector_info', default='Use the document selector above to choose which ethics source to chat with, or select "All Documents" for comprehensive guidance.'))
+        
+        st.markdown("---")
         
         # Quick actions
         st.markdown(f"⚡ {t('quick_actions', default='Quick Actions')}")
         
-        if st.button(f"🗑️ {t('clear_chat', default='Clear Chat')}", use_container_width=True, type="secondary"):
-            if 'messages' in st.session_state:
-                st.session_state.messages = []
-            if 'audio_responses' in st.session_state:
-                st.session_state.audio_responses = {}
+        if st.button(f"🗑️ {t('clear_all_chats', default='Clear All Chats')}", use_container_width=True, type="secondary"):
+            # Clear all chat sessions
+            keys_to_clear = [key for key in st.session_state.keys() if key.startswith('messages_') or key.startswith('audio_responses_')]
+            for key in keys_to_clear:
+                del st.session_state[key]
+            st.success(t('all_chats_cleared', default='All chat sessions cleared!'))
             st.rerun()
 
 def get_simplified_css() -> str:
-    """Get simplified CSS for ethics-only interface"""
+    """Get simplified CSS for comprehensive ethics interface"""
     base_css = """
     <style>
         /* Import Google Fonts */
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
         @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Arabic:wght@300;400;500;600;700&display=swap');
         
-        /* Roehampton University Brand Colors */
+        /* Roehampton University Brand Colors - Updated for comprehensive ethics */
     :root {
         --roehampton-green: #2F4F6F;            /* Now Slate Blue */
         --roehampton-dark-green: #1D2F3F;       /* Deep Navy */
@@ -366,6 +400,8 @@ def get_simplified_css() -> str:
         --border-color: #DDE3E9;                /* Light Blue-Grey Border */
         --shadow: 0 2px 4px rgba(47, 79, 111, 0.08);
         --shadow-lg: 0 8px 25px rgba(47, 79, 111, 0.12);
+        --accent-islamic: #008751;               /* Islamic Green */
+        --accent-modern: #6366F1;               /* Modern Purple */
         }
         
         /* Global styling */
@@ -381,9 +417,9 @@ def get_simplified_css() -> str:
             text-align: right !important;
         }
         
-        /* Header styling */
+        /* Header styling - Enhanced for comprehensive ethics */
         .ethics-header {
-            background: linear-gradient(135deg, var(--roehampton-green), var(--roehampton-dark-green));
+            background: linear-gradient(135deg, var(--roehampton-green), var(--roehampton-dark-green), var(--accent-islamic));
             padding: 2.5rem 2rem;
             border-radius: 15px;
             margin-bottom: 2rem;
@@ -394,6 +430,16 @@ def get_simplified_css() -> str:
             overflow: hidden;
         }
         
+        .ethics-header::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(45deg, rgba(0,135,81,0.1), rgba(99,102,241,0.1));
+            pointer-events: none;
+        }
      
         /* Chat interface prominence */
         .chat-section {
@@ -408,7 +454,7 @@ def get_simplified_css() -> str:
         .chat-welcome {
             text-align: center;
             padding: 2rem;
-            background: linear-gradient(135deg, #f0fdf9, #e8f5f0);
+            background: linear-gradient(135deg, #f0fdf9, #e8f5f0, #f3e8ff);
             border-radius: 12px;
             margin-bottom: 2rem;
             border: 1px solid var(--roehampton-light-green);
@@ -458,7 +504,17 @@ def get_simplified_css() -> str:
             font-weight: 400;
         }
         
-        /* Button styling */
+        /* Multi-source indicator */
+        .source-indicator {
+            background: rgba(255,255,255,0.2);
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            margin-top: 1rem;
+            display: inline-block;
+        }
+        
+        /* Button styling - Enhanced */
         .stButton > button {
             border-radius: 12px;
             font-weight: 600;
@@ -469,7 +525,7 @@ def get_simplified_css() -> str:
         }
         
         .stButton > button[data-baseweb="button"][kind="primary"] {
-            background: linear-gradient(135deg, var(--roehampton-green), var(--roehampton-dark-green));
+            background: linear-gradient(135deg, var(--roehampton-green), var(--accent-islamic));
             color: white;
             box-shadow: var(--shadow);
         }
@@ -498,7 +554,7 @@ def get_simplified_css() -> str:
         }
         
         .audio-controls {
-            background: linear-gradient(135deg, var(--roehampton-green), var(--roehampton-dark-green));
+            background: linear-gradient(135deg, var(--roehampton-green), var(--accent-islamic));
             border-radius: 25px;
             padding: 12px 20px;
             display: flex;
@@ -510,7 +566,7 @@ def get_simplified_css() -> str:
         
         .audio-controls:hover {
             transform: translateY(-2px);
-            box-shadow: 0 6px 25px rgba(0, 168, 107, 0.3);
+            box-shadow: 0 6px 25px rgba(0, 135, 81, 0.3);
         }
         
         /* Input styling */
@@ -524,12 +580,12 @@ def get_simplified_css() -> str:
         
         .stTextInput > div > div > input:focus {
             border-color: var(--roehampton-green);
-            box-shadow: 0 0 0 3px rgba(0, 168, 107, 0.1);
+            box-shadow: 0 0 0 3px rgba(0, 135, 81, 0.1);
         }
         
-        /* Status indicators */
+        /* Status indicators - Enhanced for multiple sources */
         .status-success {
-            background: linear-gradient(135deg, var(--roehampton-green), var(--roehampton-dark-green));
+            background: linear-gradient(135deg, var(--accent-islamic), var(--roehampton-green));
             color: white;
             padding: 0.6rem 1.2rem;
             border-radius: 25px;
@@ -539,6 +595,18 @@ def get_simplified_css() -> str:
             align-items: center;
             gap: 0.5rem;
             box-shadow: var(--shadow);
+        }
+        
+        .status-warning {
+            background: linear-gradient(135deg, #F59E0B, #D97706);
+            color: white;
+            padding: 0.6rem 1.2rem;
+            border-radius: 25px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
         }
         
         .status-error {
@@ -552,6 +620,20 @@ def get_simplified_css() -> str:
             align-items: center;
             gap: 0.5rem;
         }
+        
+        /* PDF indicator badges */
+        .pdf-badge {
+            background: rgba(255,255,255,0.9);
+            color: var(--roehampton-green);
+            padding: 0.3rem 0.8rem;
+            border-radius: 15px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            margin: 0.2rem;
+            display: inline-block;
+            box-shadow: var(--shadow);
+        }
+        
         /* Reduce sidebar width */
         .css-1d391kg {
             width: 250px !important;
@@ -574,6 +656,7 @@ def get_simplified_css() -> str:
             padding-top: 5rem !important;
             padding-bottom: 5rem !important;
         }
+        
         /* Responsive design */
         @media (max-width: 768px) {
             .ethics-header h1 {
@@ -599,7 +682,7 @@ def get_simplified_css() -> str:
     return base_css + rtl_css
 
 def main():
-    """Simplified main application - ethics only"""
+    """Ethics application with file selection feature"""
     try:
         # Initialize session state
         initialize_session_state()
@@ -612,33 +695,83 @@ def main():
         
         # Main content
         if not ETHICS_AVAILABLE:
-            st.error(t('ethics_system_not_available', default='❌ Ethics system is not available'))
-            st.info(t('ensure_ethics_files', default="Please ensure 'ethics_handler.py' exists and 'reforming_modernity.pdf' is in your data folder."))
+            st.error(t('ethics_system_not_available', default='❌ Ethics system with file selection is not available'))
+            st.info(t('ensure_ethics_files_selector', default="Please ensure 'ethics_handler.py' exists and the ethics PDF files are in your data folder."))
             st.stop()
         
         # Load logo
         logo_base64 = load_logo_from_assets()
+        
+        # Check PDF availability
+        from ethics_handler import get_available_pdfs, EthicsConfig
+        available_pdfs = get_available_pdfs()
+        
+        # Create PDF badges for available documents
+        pdf_badges = ""
+        for pdf in available_pdfs:
+            pdf_name = EthicsConfig.PDF_DISPLAY_NAMES.get(pdf, pdf.replace('.pdf', '').replace('_', ' ').title())
+            pdf_badges += f'<span class="pdf-badge">{pdf_name}</span>'
         
         if logo_base64:
             st.markdown(f"""
             <div class="ethics-header">
                 <div class="logo-title-container">
                     <div>
-                        <h1>{t('app_title', default='Ethics Assistant')}</h1>
+                        <h1>{t('ethics_file_selector_title', default='Ethics Assistant with Document Selection')}</h1>
                     </div>
                 </div>
-                <p>{t('app_subtitle', default='Your guide to ethical decision-making based on professional principles')}</p>
+                <p>{t('file_selector_subtitle', default='Choose specific documents or combine multiple sources for comprehensive ethical guidance')}</p>
+                <div class="source-indicator">
+                    📚 {len(available_pdfs)} {t('documents_available', default='documents available')} | 🎯 {t('selective_chat', default='Selective Chat Mode')}
+                </div>
+                <div style="margin-top: 1rem;">
+                    {pdf_badges}
+                </div>
             </div>
             """, unsafe_allow_html=True)
         else:
             st.markdown(f"""
             <div class="ethics-header">
-                <h1>📋 {t('app_title', default='Ethics Assistant')}</h1>
-                <p>{t('app_subtitle', default='Your guide to ethical decision-making based on professional principles')}</p>
+                <h1>📋 {t('ethics_file_selector_title', default='Ethics Assistant with Document Selection')}</h1>
+                <p>{t('file_selector_subtitle', default='Choose specific documents or combine multiple sources for comprehensive ethical guidance')}</p>
+                <div class="source-indicator">
+                    📚 {len(available_pdfs)} {t('documents_available', default='documents available')} | 🎯 {t('selective_chat', default='Selective Chat Mode')}
+                </div>
+                <div style="margin-top: 1rem;">
+                    {pdf_badges}
+                </div>
             </div>
             """, unsafe_allow_html=True)
         
-        # Render ethics chat interface
+        # Show helpful information about the file selector feature
+        with st.expander(f"ℹ️ {t('how_file_selection_works', default='How Document Selection Works')}", expanded=False):
+            st.markdown(f"""
+            **{t('individual_documents', default='Individual Documents')}:**
+            - 📗 **Islamic Ethics (Volume 1)**: {t('islamic_vol1_desc', default='Core Islamic ethical principles and foundations')}
+            - 📘 **Islamic Ethics (Volume 2)**: {t('islamic_vol2_desc', default='Advanced Islamic ethical applications and cases')}
+            - 📙 **Reforming Modernity**: {t('reforming_desc', default='Contemporary ethical frameworks and modern perspectives')}
+            
+            **📚 {t('all_documents_combined', default='All Documents Combined')}**: {t('comprehensive_desc', default='Access all sources simultaneously for comprehensive, multi-perspective guidance')}
+            
+            **{t('benefits', default='Benefits')}:**
+            - 🎯 {t('focused_expertise', default='Get focused expertise from specific traditions')}
+            - 🔄 {t('easy_switching', default='Easily switch between different ethical perspectives')}
+            - 💬 {t('separate_conversations', default='Maintain separate conversation histories for each source')}
+            - 🔍 {t('comparative_analysis', default='Compare different approaches by chatting with multiple sources')}
+            """)
+        
+        # Show PDF status if some are missing
+        if len(available_pdfs) < len(Config.ETHICS_PDF_FILES):
+            missing_pdfs = [pdf for pdf in Config.ETHICS_PDF_FILES if pdf not in available_pdfs]
+            missing_display = [EthicsConfig.PDF_DISPLAY_NAMES.get(pdf, pdf) for pdf in missing_pdfs]
+            st.warning(f"⚠️ {t('some_documents_missing', default='Some documents are missing')}: {', '.join(missing_display)}")
+            st.info(t('app_works_with_available', default='The application will work with the available documents.'))
+        
+        if not available_pdfs:
+            st.error(t('no_documents_available', default='❌ No documents are available. Please add PDF files to the data folder.'))
+            st.stop()
+        
+        # Render ethics chat interface with file selection
         render_ethics_chat_interface()
         
     except Exception as e:

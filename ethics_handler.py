@@ -1,11 +1,11 @@
-# ethics_handler.py - Simplified Version without Authentication
+# ethics_handler.py - File Selector Version
 
 import streamlit as st
 import os
 import time
 import logging
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 from openai import OpenAI
 import traceback
 
@@ -37,12 +37,22 @@ def get_openai_client():
 
 class EthicsConfig:
     """Configuration for ethics document handling"""
-    ETHICS_PDF_FILE = "reforming_modernity.pdf"  # Your ethics PDF file
+    ETHICS_PDF_FILES = [
+        "Islamic_Ethics.pdf",
+        "Islamic_Ethics2.pdf", 
+        "reforming_modernity.pdf"
+    ]
+    PDF_DISPLAY_NAMES = {
+        "Islamic_Ethics.pdf": "📗 Islamic Ethics (Volume 1)",
+        "Islamic_Ethics2.pdf": "📘 Islamic Ethics (Volume 2)", 
+        "reforming_modernity.pdf": "📙 Reforming Modernity"
+    }
     DATA_FOLDER = "data"
     MAX_TOKENS = 1500
     TEMPERATURE = 0.3
     MODEL = "gpt-3.5-turbo"
-    MAX_CONTENT_LENGTH = 15000
+    MAX_CONTENT_LENGTH = 15000  # Per document limit
+    MAX_TOTAL_CONTENT_LENGTH = 40000  # Total content limit for all documents
 
 def read_pdf_directly(file_path: Path) -> Tuple[Optional[str], Dict[str, Any]]:
     """Read PDF file directly using PyPDF2"""
@@ -54,7 +64,7 @@ def read_pdf_directly(file_path: Path) -> Tuple[Optional[str], Dict[str, Any]]:
         text = ""
         total_pages = len(reader.pages)
         
-        logger.info(f"PDF has {total_pages} pages")
+        logger.info(f"PDF {file_path.name} has {total_pages} pages")
         
         for page_num, page in enumerate(reader.pages):
             try:
@@ -62,11 +72,11 @@ def read_pdf_directly(file_path: Path) -> Tuple[Optional[str], Dict[str, Any]]:
                 if page_text and page_text.strip():
                     text += f"\n--- Page {page_num + 1} ---\n"
                     text += page_text
-                    logger.info(f"Successfully extracted text from page {page_num + 1}")
+                    logger.info(f"Successfully extracted text from page {page_num + 1} of {file_path.name}")
                 else:
-                    logger.warning(f"No text found on page {page_num + 1}")
+                    logger.warning(f"No text found on page {page_num + 1} of {file_path.name}")
             except Exception as e:
-                logger.warning(f"Error extracting text from page {page_num + 1}: {e}")
+                logger.warning(f"Error extracting text from page {page_num + 1} of {file_path.name}: {e}")
                 continue
         
         metadata = {
@@ -75,30 +85,31 @@ def read_pdf_directly(file_path: Path) -> Tuple[Optional[str], Dict[str, Any]]:
             'file_type': 'PDF',
             'word_count': len(text.split()) if text else 0,
             'character_count': len(text),
+            'filename': file_path.name
         }
         
-        logger.info(f"Successfully read PDF. Text length: {len(text)} characters")
+        logger.info(f"Successfully read PDF {file_path.name}. Text length: {len(text)} characters")
         return text, metadata
         
     except Exception as e:
-        logger.error(f"Error reading PDF directly: {e}")
-        return None, {'error': str(e)}
+        logger.error(f"Error reading PDF {file_path.name} directly: {e}")
+        return None, {'error': str(e), 'filename': file_path.name}
 
-def load_ethics_document() -> Tuple[Optional[str], Dict[str, Any], str]:
-    """Load the ethics document (reforming_modernity.pdf) with better error handling"""
+def load_single_ethics_document(pdf_filename: str) -> Tuple[Optional[str], Dict[str, Any], str]:
+    """Load a single ethics document"""
     try:
-        pdf_path = Path(EthicsConfig.DATA_FOLDER) / EthicsConfig.ETHICS_PDF_FILE
+        pdf_path = Path(EthicsConfig.DATA_FOLDER) / pdf_filename
         
-        logger.info(f"Attempting to load ethics document from: {pdf_path}")
+        logger.info(f"Attempting to load single document: {pdf_path}")
         
         if not pdf_path.exists():
-            error_msg = f"Ethics document not found: {pdf_path}"
+            error_msg = f"Ethics document not found: {pdf_filename}"
             logger.error(error_msg)
             return None, {}, error_msg
         
         # Check if the file is readable
         if not os.access(pdf_path, os.R_OK):
-            error_msg = f"Cannot read ethics document: {pdf_path} (permission denied)"
+            error_msg = f"Cannot read ethics document: {pdf_filename} (permission denied)"
             logger.error(error_msg)
             return None, {}, error_msg
         
@@ -107,50 +118,185 @@ def load_ethics_document() -> Tuple[Optional[str], Dict[str, Any], str]:
         logger.info(f"File size: {file_size} bytes")
         
         if file_size == 0:
-            error_msg = f"Ethics document is empty: {pdf_path}"
+            error_msg = f"Ethics document is empty: {pdf_filename}"
             logger.error(error_msg)
             return None, {}, error_msg
         
         # Try to read PDF directly first
-        logger.info("Attempting to read PDF directly with PyPDF2")
+        logger.info(f"Reading {pdf_filename} with PyPDF2")
         content, metadata = read_pdf_directly(pdf_path)
         
         if content and content.strip():
-            logger.info(f"Successfully loaded ethics document using direct PDF reader")
-            logger.info(f"Content length: {len(content)} characters")
-            logger.info(f"Metadata keys: {list(metadata.keys()) if metadata else 'No metadata'}")
-            return content, metadata, f"Loaded {EthicsConfig.ETHICS_PDF_FILE} successfully"
+            # Truncate if too long
+            if len(content) > EthicsConfig.MAX_CONTENT_LENGTH:
+                content = content[:EthicsConfig.MAX_CONTENT_LENGTH] + "\n...(content truncated)..."
+                logger.info(f"Truncated {pdf_filename} content to {EthicsConfig.MAX_CONTENT_LENGTH} characters")
+            
+            logger.info(f"Successfully loaded {pdf_filename}")
+            return content, metadata, f"Successfully loaded {pdf_filename}"
         
-        # If direct reading failed, try importing from app
-        logger.info("Direct PDF reading failed, trying to import from app.py")
+        # Try importing from app if direct reading failed
+        logger.info(f"Direct PDF reading failed for {pdf_filename}, trying app.read_document")
         try:
             from app import read_document
-            logger.info("Successfully imported read_document function from app")
             content, metadata = read_document(pdf_path)
             
             if content and content.strip():
-                logger.info(f"Successfully loaded ethics document using app.read_document")
-                return content, metadata, f"Loaded {EthicsConfig.ETHICS_PDF_FILE} successfully"
+                if len(content) > EthicsConfig.MAX_CONTENT_LENGTH:
+                    content = content[:EthicsConfig.MAX_CONTENT_LENGTH] + "\n...(content truncated)..."
+                
+                logger.info(f"Successfully loaded {pdf_filename} using app.read_document")
+                return content, metadata, f"Successfully loaded {pdf_filename}"
+            else:
+                error_msg = f"Failed to extract content from {pdf_filename}"
+                logger.error(error_msg)
+                return None, metadata or {}, error_msg
         except ImportError as e:
             logger.warning(f"Cannot import read_document function: {e}")
+            error_msg = f"Failed to load {pdf_filename}: import error"
+            return None, {}, error_msg
         except Exception as e:
-            logger.warning(f"Error using app.read_document: {e}")
-        
-        # If both methods failed
-        error_msg = f"Failed to extract content from {EthicsConfig.ETHICS_PDF_FILE}. The PDF might be corrupted, password-protected, or contain only images."
-        logger.error(error_msg)
-        return None, metadata or {}, error_msg
+            logger.warning(f"Error using app.read_document for {pdf_filename}: {e}")
+            error_msg = f"Failed to load {pdf_filename}: {str(e)}"
+            return None, {}, error_msg
             
     except Exception as e:
-        error_msg = f"Error loading ethics document: {str(e)}"
+        error_msg = f"Error loading ethics document {pdf_filename}: {str(e)}"
         logger.error(error_msg)
         logger.error(f"Full traceback: {traceback.format_exc()}")
         return None, {}, error_msg
 
-def generate_ethics_response(question: str, document_content: str) -> str:
-    """Generate AI response for ethics-related questions (simplified, no student info needed)"""
+def load_multiple_ethics_documents() -> Tuple[Optional[Dict[str, str]], Dict[str, Dict[str, Any]], List[str]]:
+    """Load all ethics documents and combine them"""
     try:
-        logger.info("Starting ethics response generation")
+        all_content = {}
+        all_metadata = {}
+        messages = []
+        
+        logger.info("Loading multiple ethics documents")
+        
+        for pdf_file in EthicsConfig.ETHICS_PDF_FILES:
+            pdf_path = Path(EthicsConfig.DATA_FOLDER) / pdf_file
+            
+            logger.info(f"Attempting to load: {pdf_path}")
+            
+            if not pdf_path.exists():
+                error_msg = f"Ethics document not found: {pdf_file}"
+                logger.warning(error_msg)
+                messages.append(f"⚠️ {error_msg}")
+                continue
+            
+            # Check if the file is readable
+            if not os.access(pdf_path, os.R_OK):
+                error_msg = f"Cannot read ethics document: {pdf_file} (permission denied)"
+                logger.warning(error_msg)
+                messages.append(f"⚠️ {error_msg}")
+                continue
+            
+            # Check file size
+            file_size = pdf_path.stat().st_size
+            logger.info(f"File {pdf_file} size: {file_size} bytes")
+            
+            if file_size == 0:
+                error_msg = f"Ethics document is empty: {pdf_file}"
+                logger.warning(error_msg)
+                messages.append(f"⚠️ {error_msg}")
+                continue
+            
+            # Try to read PDF directly first
+            logger.info(f"Reading {pdf_file} with PyPDF2")
+            content, metadata = read_pdf_directly(pdf_path)
+            
+            if content and content.strip():
+                # Truncate individual document if too long
+                if len(content) > EthicsConfig.MAX_CONTENT_LENGTH:
+                    content = content[:EthicsConfig.MAX_CONTENT_LENGTH] + "\n...(content truncated)..."
+                    logger.info(f"Truncated {pdf_file} content to {EthicsConfig.MAX_CONTENT_LENGTH} characters")
+                
+                all_content[pdf_file] = content
+                all_metadata[pdf_file] = metadata
+                messages.append(f"✅ Successfully loaded {pdf_file}")
+                logger.info(f"Successfully loaded {pdf_file}")
+            else:
+                # Try importing from app if direct reading failed
+                logger.info(f"Direct PDF reading failed for {pdf_file}, trying app.read_document")
+                try:
+                    from app import read_document
+                    content, metadata = read_document(pdf_path)
+                    
+                    if content and content.strip():
+                        if len(content) > EthicsConfig.MAX_CONTENT_LENGTH:
+                            content = content[:EthicsConfig.MAX_CONTENT_LENGTH] + "\n...(content truncated)..."
+                        
+                        all_content[pdf_file] = content
+                        all_metadata[pdf_file] = metadata
+                        messages.append(f"✅ Successfully loaded {pdf_file} (using app reader)")
+                        logger.info(f"Successfully loaded {pdf_file} using app.read_document")
+                    else:
+                        error_msg = f"Failed to extract content from {pdf_file}"
+                        logger.warning(error_msg)
+                        messages.append(f"❌ {error_msg}")
+                except ImportError as e:
+                    logger.warning(f"Cannot import read_document function: {e}")
+                    messages.append(f"❌ Failed to load {pdf_file}: import error")
+                except Exception as e:
+                    logger.warning(f"Error using app.read_document for {pdf_file}: {e}")
+                    messages.append(f"❌ Failed to load {pdf_file}: {str(e)}")
+        
+        if not all_content:
+            error_msg = "No ethics documents could be loaded"
+            logger.error(error_msg)
+            return None, {}, [f"❌ {error_msg}"]
+        
+        # Combine all content with document separators
+        combined_content = ""
+        total_length = 0
+        
+        for pdf_file, content in all_content.items():
+            document_header = f"\n\n{'='*80}\nDOCUMENT: {pdf_file}\n{'='*80}\n\n"
+            
+            # Check if adding this document would exceed total limit
+            addition_length = len(document_header) + len(content)
+            if total_length + addition_length > EthicsConfig.MAX_TOTAL_CONTENT_LENGTH:
+                remaining_space = EthicsConfig.MAX_TOTAL_CONTENT_LENGTH - total_length - len(document_header)
+                if remaining_space > 100:  # Only add if there's meaningful space
+                    truncated_content = content[:remaining_space] + "\n...(content truncated due to total length limit)..."
+                    combined_content += document_header + truncated_content
+                    messages.append(f"⚠️ {pdf_file} was truncated due to total content length limit")
+                else:
+                    messages.append(f"⚠️ {pdf_file} was skipped due to total content length limit")
+                break
+            else:
+                combined_content += document_header + content
+                total_length += addition_length
+        
+        logger.info(f"Combined content length: {len(combined_content)} characters")
+        logger.info(f"Loaded {len(all_content)} documents successfully")
+        
+        return {"combined": combined_content}, all_metadata, messages
+            
+    except Exception as e:
+        error_msg = f"Error loading ethics documents: {str(e)}"
+        logger.error(error_msg)
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        return None, {}, [f"❌ {error_msg}"]
+
+def get_available_pdfs() -> List[str]:
+    """Get list of available PDF files"""
+    available_pdfs = []
+    data_folder = Path(EthicsConfig.DATA_FOLDER)
+    
+    for pdf_file in EthicsConfig.ETHICS_PDF_FILES:
+        pdf_path = data_folder / pdf_file
+        if pdf_path.exists() and pdf_path.stat().st_size > 0:
+            available_pdfs.append(pdf_file)
+    
+    return available_pdfs
+
+def generate_ethics_response(question: str, document_content: str, source_info: str = "") -> str:
+    """Generate AI response for ethics-related questions"""
+    try:
+        logger.info(f"Starting ethics response generation - Source: {source_info}")
         logger.info(f"Question length: {len(question) if question else 'None'}")
         logger.info(f"Document content length: {len(document_content) if document_content else 'None'}")
         
@@ -171,7 +317,7 @@ def generate_ethics_response(question: str, document_content: str) -> str:
             logger.error("No question provided")
             return error_msg
         
-        # Get current language for AI response - DIRECT METHOD
+        # Get current language for AI response
         current_language = st.session_state.get('language', 'en')
         logger.info(f"Current language from session state: {current_language}")
         
@@ -185,37 +331,60 @@ def generate_ethics_response(question: str, document_content: str) -> str:
         else:
             language_instruction = "Respond in English only."
         
-        # Truncate content if too long
-        truncated_content = document_content[:EthicsConfig.MAX_CONTENT_LENGTH]
-        logger.info(f"Using content length: {len(truncated_content)} characters")
+        logger.info(f"Using content length: {len(document_content)} characters")
         logger.info(f"AI will respond in: {current_language}")
         
-        system_prompt = f"""You are an expert ethics advisor. You are helping with ethics guidance based on the "Reforming Modernity" document.
+        # Determine system prompt based on source
+        if "all documents" in source_info.lower() or "multiple" in source_info.lower():
+            system_prompt = f"""You are an expert ethics advisor with access to multiple comprehensive ethics documents. You are helping with ethics guidance based on Islamic Ethics materials and Reforming Modernity document.
 
 LANGUAGE INSTRUCTION: {language_instruction}
 
-ETHICS DOCUMENT CONTENT:
-{truncated_content}
+SOURCE: {source_info}
+
+ETHICS DOCUMENTS CONTENT:
+{document_content}
 
 INSTRUCTIONS:
 - {language_instruction}
-- Answer ethics questions based ONLY on the provided "Reforming Modernity" document content
-- Provide thoughtful, well-reasoned ethical guidance based on what's actually in the document
-- Reference specific sections, concepts, or examples from the document when relevant
-- If the document discusses specific ethical frameworks, theories, or principles, use those
-- Help people understand and apply the ethical concepts presented in this document
-- Encourage critical thinking about ethical issues as presented in the material
+- Answer ethics questions based on the provided ethics documents (Islamic Ethics volumes and Reforming Modernity)
+- You have access to multiple comprehensive documents covering different aspects of ethical thinking
+- When relevant, reference which specific document or section contains the information you're citing
+- Provide thoughtful, well-reasoned ethical guidance that draws from the breadth of materials available
+- Compare and contrast different ethical approaches when multiple documents address similar topics
+- If Islamic ethics and modern ethical frameworks differ, explain both perspectives respectfully
+- Help people understand how different ethical traditions can inform decision-making
+- Encourage critical thinking about ethical issues as presented across all the materials
 - Be supportive and educational in your approach
-- If a question cannot be answered from the document content, clearly state this and suggest what topics the document does cover
+- If a question cannot be fully answered from any of the documents, clearly state this and suggest what topics the documents do cover
 - Always maintain academic integrity and professional ethics standards
+- When appropriate, show how Islamic ethical principles and modern ethical frameworks can complement each other
 
-CONTEXT:
-- Document: Reforming Modernity (Ethics Material)
-- Purpose: Ethics guidance based on this specific document
-- Audience: Anyone seeking ethical guidance
-- Response language: {current_language}
+Remember: Base your responses on the actual content of all provided ethics documents. Draw connections between different ethical approaches when relevant, and provide balanced guidance that respects both traditional Islamic ethics and contemporary ethical thinking. ALWAYS respond in the requested language."""
+        else:
+            system_prompt = f"""You are an expert ethics advisor focusing on a specific ethics document. You are helping with ethics guidance based on the selected document.
 
-Remember: Base your responses strictly on the actual content of the "Reforming Modernity" document. If the document focuses on specific ethical themes, theories, or applications, emphasize those in your responses. ALWAYS respond in the requested language."""
+LANGUAGE INSTRUCTION: {language_instruction}
+
+SOURCE: {source_info}
+
+ETHICS DOCUMENT CONTENT:
+{document_content}
+
+INSTRUCTIONS:
+- {language_instruction}
+- Answer ethics questions based ONLY on the provided document: {source_info}
+- Focus specifically on the content, concepts, and guidance found in this particular document
+- Provide thoughtful, well-reasoned ethical guidance based on what's actually in this specific document
+- Reference specific sections, concepts, or examples from this document when relevant
+- Help people understand and apply the ethical concepts presented in this specific material
+- Encourage critical thinking about ethical issues as presented in this document
+- Be supportive and educational in your approach
+- If a question cannot be answered from this specific document, clearly state this and suggest what topics this document does cover
+- Always maintain academic integrity and professional ethics standards
+- Stay focused on the perspective and approach of this particular document
+
+Remember: Base your responses strictly on the actual content of the selected document: {source_info}. If the document has a specific ethical perspective or methodology, emphasize that in your responses. ALWAYS respond in the requested language."""
 
         logger.info("Making OpenAI API call")
         response = client.chat.completions.create(
@@ -243,99 +412,194 @@ Remember: Base your responses strictly on the actual content of the "Reforming M
         logger.error(f"Full traceback: {traceback.format_exc()}")
         return error_msg
 
+def render_file_selector():
+    """Render file selector interface"""
+    st.markdown(f"📁 {t('select_document', default='Select Document to Chat With')}")
+    
+    available_pdfs = get_available_pdfs()
+    
+    if not available_pdfs:
+        st.error(t('no_pdfs_available', default='❌ No PDF files are available in the data folder'))
+        return None
+    
+    # Create options for selector
+    options = []
+    for pdf_file in available_pdfs:
+        display_name = EthicsConfig.PDF_DISPLAY_NAMES.get(pdf_file, pdf_file)
+        options.append((pdf_file, display_name))
+    
+    # Add "All Documents" option
+    options.append(("ALL_DOCUMENTS", f"📚 {t('all_documents', default='All Documents Combined')}"))
+    
+    # File selector
+    selected_option = st.selectbox(
+        t('choose_source', default='Choose your ethics source:'),
+        options=options,
+        format_func=lambda x: x[1],
+        help=t('file_selector_help', default='Select a specific document to focus on, or choose "All Documents" for comprehensive guidance')
+    )
+    
+    if selected_option:
+        return selected_option[0]
+    return None
+
 def render_ethics_chat_interface():
-    """Render the ethics chat interface (simplified, no authentication required)"""
+    """Render the ethics chat interface with file selection"""
     try:
-        logger.info("Starting ethics chat interface rendering")
+        logger.info("Starting ethics chat interface rendering with file selection")
         
-        # Load ethics document if not already loaded
-        if 'ethics_document' not in st.session_state or st.session_state.ethics_document is None:
-            logger.info("Loading ethics document for the first time")
-            with st.spinner("Loading ethics guidance materials..."):
-                content, metadata, message = load_ethics_document()
-                
-                if content and content.strip():
-                    st.session_state.ethics_document = {
-                        'content': content,
-                        'metadata': metadata,
-                        'filename': EthicsConfig.ETHICS_PDF_FILE
-                    }
-                    st.success(message)
-                    logger.info("Ethics document loaded successfully")
+        # File selector
+        selected_file = render_file_selector()
+        
+        if not selected_file:
+            st.info(t('please_select_document', default='Please select a document to begin chatting.'))
+            return
+        
+        # Load appropriate document(s) based on selection
+        if selected_file == "ALL_DOCUMENTS":
+            # Load all documents
+            if 'ethics_documents_all' not in st.session_state or st.session_state.ethics_documents_all is None:
+                logger.info("Loading all ethics documents")
+                with st.spinner(t('loading_all_documents', default='Loading all ethics documents...')):
+                    content_dict, metadata_dict, messages = load_multiple_ethics_documents()
                     
-                    # Show document info
-                    with st.expander(f"📖 {t('about_this_ethics_document', default='About This Ethics Document')}", expanded=False):
-                       st.markdown(f"""
-                        **{t('document', default='Document')}:** {EthicsConfig.ETHICS_PDF_FILE}
-                        **{t('pages', default='Pages')}:** {metadata.get('total_pages', 'Unknown') if metadata else 'Unknown'}
-                        **{t('words', default='Words')}:** {metadata.get('word_count', 0) if metadata else 'Unknown'}
-                        **{t('file_size', default='File Size')}:** {metadata.get('file_size', 0) if metadata else 'Unknown'} {t('bytes', default='bytes')}
-
-                        {t('ai_assistant_help_text', default='This AI assistant will help you understand and apply the ethical concepts and guidance contained in this document for professional decision-making.')}
-                        """)
-
-                else:
-                    st.error(f"❌ **{message}**")
-                    st.info(t('ensure_pdf_readable', default="Please ensure 'reforming_modernity.pdf' is in your data folder and is readable."))
-                    logger.error(f"Failed to load ethics document: {message}")
-                    
-                    # Debug information
-                    with st.expander(f"🔧 {t('debug_information', default='Debug Information')}", expanded=False):
-                        data_folder_path = Path(EthicsConfig.DATA_FOLDER)
-                        pdf_file_path = data_folder_path / EthicsConfig.ETHICS_PDF_FILE
+                    if content_dict and content_dict.get('combined'):
+                        st.session_state.ethics_documents_all = {
+                            'content': content_dict['combined'],
+                            'metadata': metadata_dict,
+                            'source_info': f"All Documents ({len(metadata_dict)} sources)"
+                        }
                         
-                        st.code(f"""
-                        Expected file path: {pdf_file_path}
-                        File exists: {pdf_file_path.exists()}
-                        Data folder exists: {data_folder_path.exists()}
-                        Content received: {content is not None}
-                        Content length: {len(content) if content else 0}
-                        Metadata: {metadata}
+                        # Show status messages
+                        for message in messages:
+                            if message.startswith('✅'):
+                                st.success(message)
+                            elif message.startswith('⚠️'):
+                                st.warning(message)
+                            elif message.startswith('❌'):
+                                st.error(message)
+                    else:
+                        for message in messages:
+                            if message.startswith('❌'):
+                                st.error(message)
+                        return
+            
+            current_doc = st.session_state.ethics_documents_all
+            source_display = f"📚 {t('all_documents', default='All Documents Combined')}"
+            
+        else:
+            # Load single document
+            session_key = f'ethics_document_{selected_file}'
+            if session_key not in st.session_state or st.session_state[session_key] is None:
+                logger.info(f"Loading single document: {selected_file}")
+                with st.spinner(f"{t('loading_document', default='Loading document')}: {EthicsConfig.PDF_DISPLAY_NAMES.get(selected_file, selected_file)}..."):
+                    content, metadata, message = load_single_ethics_document(selected_file)
+                    
+                    if content and content.strip():
+                        st.session_state[session_key] = {
+                            'content': content,
+                            'metadata': metadata,
+                            'source_info': EthicsConfig.PDF_DISPLAY_NAMES.get(selected_file, selected_file)
+                        }
+                        st.success(message)
+                    else:
+                        st.error(f"❌ {message}")
+                        return
+            
+            current_doc = st.session_state[session_key]
+            source_display = EthicsConfig.PDF_DISPLAY_NAMES.get(selected_file, selected_file)
+        
+        # Display current source info
+        st.markdown(f"**{t('current_source', default='Current Source')}:** {source_display}")
+        
+        # Show document info
+        with st.expander(f"📖 {t('about_selected_source', default='About Selected Source')}", expanded=False):
+            if selected_file == "ALL_DOCUMENTS":
+                metadata_dict = current_doc.get('metadata', {})
+                st.markdown(f"**{t('total_documents', default='Total Documents')}:** {len(metadata_dict)}")
+                
+                total_pages = 0
+                total_words = 0
+                total_size = 0
+                
+                for filename, metadata in metadata_dict.items():
+                    if metadata and not metadata.get('error'):
+                        st.markdown(f"""
+                        **📄 {filename}**
+                        - **{t('pages', default='Pages')}:** {metadata.get('total_pages', 'Unknown')}
+                        - **{t('words', default='Words')}:** {metadata.get('word_count', 0):,}
+                        - **{t('file_size', default='File Size')}:** {metadata.get('file_size', 0):,} {t('bytes', default='bytes')}
                         """)
-                    return
+                        total_pages += metadata.get('total_pages', 0)
+                        total_words += metadata.get('word_count', 0)
+                        total_size += metadata.get('file_size', 0)
+                
+                st.markdown("---")
+                st.markdown(f"""
+                **{t('combined_totals', default='Combined Totals')}:**
+                - **{t('total_pages', default='Total Pages')}:** {total_pages}
+                - **{t('total_words', default='Total Words')}:** {total_words:,}
+                - **{t('total_size', default='Total Size')}:** {total_size:,} {t('bytes', default='bytes')}
+                """)
+            else:
+                metadata = current_doc.get('metadata', {})
+                if metadata and not metadata.get('error'):
+                    st.markdown(f"""
+                    **{t('document', default='Document')}:** {selected_file}
+                    **{t('pages', default='Pages')}:** {metadata.get('total_pages', 'Unknown')}
+                    **{t('words', default='Words')}:** {metadata.get('word_count', 0):,}
+                    **{t('file_size', default='File Size')}:** {metadata.get('file_size', 0):,} {t('bytes', default='bytes')}
+                    """)
         
-        # Header for ethics assistance
-        st.markdown(f"📋 {t('ethics_guidance_assistant', default='Ethics Guidance Assistant')}")
-        st.markdown(f"**{t('document', default='Document')}:** {t('reforming_modernity', default='Reforming Modernity')}")
+        # Example questions based on selected source
+        with st.expander(f"💡 {t('example_questions', default='Example Questions for This Source')}", expanded=False):
+            if selected_file == "ALL_DOCUMENTS":
+                st.markdown(f"""
+                **{t('comprehensive_questions', default='Comprehensive Questions:')}**
+                - "{t('compare_approaches', default='How do Islamic and modern approaches compare on [topic]?')}"
+                - "{t('synthesize_guidance', default='What guidance do all sources provide for [situation]?')}"
+                - "{t('different_perspectives', default='What different perspectives do these documents offer on [ethical issue]?')}"
+                
+                **{t('specific_comparisons', default='Specific Comparisons:')}**
+                - "{t('business_ethics_comparison', default='How do Islamic ethics and modern frameworks approach business responsibility?')}"
+                - "{t('social_justice_perspectives', default='What are the different perspectives on social justice across these sources?')}"
+                """)
+            elif "Islamic_Ethics" in selected_file:
+                st.markdown(f"""
+                **{t('islamic_ethics_questions', default='Islamic Ethics Questions:')}**
+                - "{t('islamic_principle_question', default='What Islamic principles guide [specific situation]?')}"
+                - "{t('quran_hadith_guidance', default='What guidance does this source provide from Quran and Hadith on [topic]?')}"
+                - "{t('islamic_business_ethics', default='How does Islamic ethics approach business and financial decisions?')}"
+                - "{t('islamic_social_responsibility', default='What does this volume say about social responsibility?')}"
+                """)
+            elif "reforming_modernity" in selected_file:
+                st.markdown(f"""
+                **{t('modern_ethics_questions', default='Modern Ethics Questions:')}**
+                - "{t('contemporary_approach', default='How does this document approach contemporary ethical challenges?')}"
+                - "{t('modernity_reform', default='What reforms to modern thinking does this document suggest?')}"
+                - "{t('modern_frameworks', default='What ethical frameworks are discussed for modern society?')}"
+                """)
         
-        # General example questions
-        with st.expander(f"💡 {t('how_to_use_ethics_assistant', default='How to Use This Ethics Assistant')}", expanded=False):
-            st.markdown(f"""
-            **{t('you_can_ask_questions_like', default='You can ask questions like:')}**
-            - "{t('main_ethical_principles_question', default='What are the main ethical principles discussed in this document?')}"
-            - "{t('ethical_behavior_definition', default='How does this document define ethical behavior?')}"
-            - "{t('guidance_for_situation', default='What guidance does this provide for [specific situation]?')}"
-            - "{t('summarize_ethical_concepts', default='Can you summarize the key ethical concepts covered?')}"
-            - "{t('document_says_about_topic', default='What does this document say about [specific ethical topic]?')}"
-            - "{t('apply_ethical_principles', default='How should I apply these ethical principles in my work/life?')}"
-
-            **{t('tips', default='Tips:')}**
-            - {t('be_specific_guidance', default='Be specific about what ethical guidance you\'re looking for')}
-            - {t('ask_about_concepts', default='Ask about concepts, principles, or situations mentioned in the document')}
-            - {t('request_examples', default='Request examples or applications of ethical principles')}
-            - {t('ask_for_clarification', default='Ask for clarification of complex ethical ideas')}
-            """)
+        # Initialize chat for this source
+        chat_key = f'messages_{selected_file}'
+        audio_key = f'audio_responses_{selected_file}'
         
-        # Make chat interface more prominent for clients
+        if chat_key not in st.session_state:
+            st.session_state[chat_key] = []
+        if audio_key not in st.session_state:
+            st.session_state[audio_key] = {}
+        
+        # Chat interface
         st.markdown("---")
-        st.markdown(f"💬 {t('ask_your_ethics_question', default='Ask Your Ethics Question')}")
-        st.markdown(f"*{t('get_personalized_guidance', default='Get personalized ethics guidance based on professional principles')}*")
-
+        st.markdown(f"💬 {t('chat_with_source', default='Chat with Selected Source')}")
         
-        # Initialize messages if not exists
-        if 'messages' not in st.session_state:
-            st.session_state.messages = []
-        
-        if 'audio_responses' not in st.session_state:
-            st.session_state.audio_responses = {}
-        
-        # Chat messages display
-        for i, message in enumerate(st.session_state.messages):
+        # Display chat messages
+        for i, message in enumerate(st.session_state[chat_key]):
             if not isinstance(message, dict):
                 logger.warning(f"Invalid message format at index {i}: {message}")
                 continue
                 
-            message_key = f"ethics_msg_{i}_{message.get('timestamp', time.time())}"
+            message_key = f"msg_{selected_file}_{i}_{message.get('timestamp', time.time())}"
             
             if message.get("role") == "user":
                 st.markdown(f"""
@@ -346,13 +610,13 @@ def render_ethics_chat_interface():
             elif message.get("role") == "assistant":
                 st.markdown(f"""
                 <div style="background: #f3e5f5; color: #000; padding: 1rem; border-radius: 10px; margin: 1rem 0; border-left: 4px solid #7b1fa2;">
-                    <strong>📋 {t('ethics_advisor', default='Ethics Advisor')}:</strong><br>{message.get('content', '')}
+                    <strong>📋 {t('ethics_advisor', default='Ethics Advisor')} ({source_display}):</strong><br>{message.get('content', '')}
                 </div>
                 """, unsafe_allow_html=True)
                 
                 # Add audio support if enabled
                 if st.session_state.get('audio_enabled', True):
-                    if message_key not in st.session_state.audio_responses:
+                    if message_key not in st.session_state[audio_key]:
                         try:
                             from app import generate_audio_response, create_audio_player
                             with st.spinner(t('generating_audio', default='Generating audio...')):
@@ -361,16 +625,16 @@ def render_ethics_chat_interface():
                                     st.session_state.get('selected_voice', 'alloy')
                                 )
                                 if audio_bytes:
-                                    st.session_state.audio_responses[message_key] = audio_bytes
+                                    st.session_state[audio_key][message_key] = audio_bytes
                         except Exception as e:
                             logger.error(f"Error generating audio: {e}")
                     
                     # Display audio player if available
-                    if message_key in st.session_state.audio_responses:
+                    if message_key in st.session_state[audio_key]:
                         try:
                             from app import create_audio_player
                             audio_html = create_audio_player(
-                                st.session_state.audio_responses[message_key], 
+                                st.session_state[audio_key][message_key], 
                                 key=message_key
                             )
                             st.markdown(audio_html, unsafe_allow_html=True)
@@ -378,9 +642,10 @@ def render_ethics_chat_interface():
                             logger.error(f"Error displaying audio player: {e}")
         
         # Chat input
-        if prompt := st.chat_input(t('ethics_question_placeholder', default="Ask your ethics question here... (e.g., 'How should I handle this ethical dilemma?')")):
+        placeholder_text = t('ask_question_about_source', default=f'Ask a question about {source_display}...')
+        if prompt := st.chat_input(placeholder_text):
             try:
-                logger.info(f"Processing user input: {prompt[:100]}...")
+                logger.info(f"Processing user input for {selected_file}: {prompt[:100]}...")
                 
                 # Add user message
                 user_message = {
@@ -388,7 +653,7 @@ def render_ethics_chat_interface():
                     "content": prompt,
                     "timestamp": time.time()
                 }
-                st.session_state.messages.append(user_message)
+                st.session_state[chat_key].append(user_message)
                 
                 # Immediately display the user message
                 st.markdown(f"""
@@ -398,15 +663,11 @@ def render_ethics_chat_interface():
                 """, unsafe_allow_html=True)
                 
                 # Generate ethics response
-                with st.spinner(t('consulting_ethics', default='Consulting ethics guidance...')):
-                    ethics_doc = st.session_state.get('ethics_document')
-                    if not ethics_doc or not ethics_doc.get('content'):
-                        st.error(t('ethics_document_not_loaded', default='❌ **Ethics document not properly loaded**'))
-                        return
-                    
+                with st.spinner(f"{t('consulting', default='Consulting')} {source_display}..."):
                     response = generate_ethics_response(
                         prompt,
-                        ethics_doc['content']
+                        current_doc['content'],
+                        current_doc['source_info']
                     )
                 
                 # Add AI response
@@ -415,18 +676,18 @@ def render_ethics_chat_interface():
                     "content": response,
                     "timestamp": time.time()
                 }
-                st.session_state.messages.append(ai_message)
+                st.session_state[chat_key].append(ai_message)
                 
                 # Immediately display the AI response
                 st.markdown(f"""
                 <div style="background: #f3e5f5; color: #000; padding: 1rem; border-radius: 10px; margin: 1rem 0; border-left: 4px solid #7b1fa2;">
-                    <strong>📋 {t('ethics_advisor', default='Ethics Advisor')}:</strong><br>{response}
+                    <strong>📋 {t('ethics_advisor', default='Ethics Advisor')} ({source_display}):</strong><br>{response}
                 </div>
                 """, unsafe_allow_html=True)
                 
                 # Generate and display audio if enabled
                 if st.session_state.get('audio_enabled', True):
-                    message_key = f"ethics_msg_{len(st.session_state.messages)-1}_{ai_message['timestamp']}"
+                    message_key = f"msg_{selected_file}_{len(st.session_state[chat_key])-1}_{ai_message['timestamp']}"
                     try:
                         from app import generate_audio_response, create_audio_player
                         with st.spinner(t('generating_audio', default='Generating audio...')):
@@ -435,7 +696,7 @@ def render_ethics_chat_interface():
                                 st.session_state.get('selected_voice', 'alloy')
                             )
                             if audio_bytes:
-                                st.session_state.audio_responses[message_key] = audio_bytes
+                                st.session_state[audio_key][message_key] = audio_bytes
                                 # Display audio player immediately
                                 audio_html = create_audio_player(audio_bytes, key=message_key)
                                 st.markdown(audio_html, unsafe_allow_html=True)
@@ -443,7 +704,6 @@ def render_ethics_chat_interface():
                         logger.error(f"Error generating audio: {e}")
                 
                 logger.info("Successfully processed user input and generated response")
-                # Don't rerun here - let the display happen naturally
                 
             except Exception as e:
                 error_msg = f"❌ **Error processing your question: {str(e)}**"
@@ -452,18 +712,26 @@ def render_ethics_chat_interface():
                 logger.error(f"Full traceback: {traceback.format_exc()}")
         
         # Control buttons
-        col1, col2 = st.columns([1, 1])
+        col1, col2, col3 = st.columns([1, 1, 1])
         
         with col1:
             if st.button(f"🔄 {t('new_session', default='New Session')}", type="secondary"):
-                st.session_state.messages = []
-                st.session_state.audio_responses = {}
+                st.session_state[chat_key] = []
+                st.session_state[audio_key] = {}
                 st.rerun()
         
         with col2:
             if st.button(f"🗑️ {t('clear_chat', default='Clear Chat')}", type="secondary"):
-                st.session_state.messages = []
-                st.session_state.audio_responses = {}
+                st.session_state[chat_key] = []
+                st.session_state[audio_key] = {}
+                st.rerun()
+        
+        with col3:
+            if st.button(f"📁 {t('change_source', default='Change Source')}", type="secondary"):
+                # Clear current selection to force re-selection
+                if 'file_selector_reset' not in st.session_state:
+                    st.session_state.file_selector_reset = 0
+                st.session_state.file_selector_reset += 1
                 st.rerun()
                 
     except Exception as e:
@@ -477,14 +745,23 @@ def render_ethics_chat_interface():
             st.code(f"""
             Error: {str(e)}
             Session state keys: {list(st.session_state.keys())}
-            Ethics document: {getattr(st.session_state, 'ethics_document', 'Not set')}
+            Selected file: {locals().get('selected_file', 'Not selected')}
+            Available PDFs: {get_available_pdfs()}
             """)
 
 def initialize_ethics_session_state():
-    """Initialize ethics-specific session state variables"""
+    """Initialize ethics-specific session state variables for file selection"""
     try:
-        if 'ethics_document' not in st.session_state:
-            st.session_state.ethics_document = None
-        logger.info("Ethics session state initialized successfully")
+        # Initialize containers for different document types
+        if 'ethics_documents_all' not in st.session_state:
+            st.session_state.ethics_documents_all = None
+        
+        # Initialize individual document containers
+        for pdf_file in EthicsConfig.ETHICS_PDF_FILES:
+            session_key = f'ethics_document_{pdf_file}'
+            if session_key not in st.session_state:
+                st.session_state[session_key] = None
+        
+        logger.info("Ethics session state initialized successfully for file selection")
     except Exception as e:
         logger.error(f"Error initializing ethics session state: {e}")

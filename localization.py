@@ -42,7 +42,7 @@ def load_translations():
             'ai_connected': 'AI Service Connected',
             'ai_not_connected': 'AI Service Not Available',
             'app_title': 'Ethics Assistant',
-            'app_subtitle': 'Your guide to ethical decision-making'
+            'app_subtitle': 'Your guide to Trusteeship AI Ethics'
         }
     }
     

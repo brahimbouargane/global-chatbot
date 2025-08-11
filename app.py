@@ -717,7 +717,7 @@ def main():
             <div class="ethics-header">
                 <div class="logo-title-container">
                     <div>
-                        <h1>{t('ethics_file_selector_title', default='AI Ethics Assistant with Document Selection')}</h1>
+                        <h1>{t('ethics_file_selector_title', default='Trusteeship AI Ethics chatbot')}</h1>
                     </div>
                 </div>
                 <p>{t('file_selector_subtitle', default='Choose specific documents or combine multiple sources for comprehensive ethical guidance')}</p>
@@ -732,7 +732,7 @@ def main():
         else:
             st.markdown(f"""
             <div class="ethics-header">
-                <h1>📋 {t('ethics_file_selector_title', default='AI Ethics Assistant with Document Selection')}</h1>
+                <h1>📋 {t('ethics_file_selector_title', default='Trusteeship AI Ethics chatbot')}</h1>
                 <p>{t('file_selector_subtitle', default='Choose specific documents or combine multiple sources for comprehensive ethical guidance')}</p>
                 <div class="source-indicator">
                     📚 {len(available_pdfs)} {t('documents_available', default='documents available')} | 🎯 {t('selective_chat', default='Selective Chat Mode')}

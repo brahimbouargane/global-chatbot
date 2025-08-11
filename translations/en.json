@@ -9,7 +9,7 @@
   "api_key_not_found": "OpenAI API key not found!",
   "app_error": "Application Error: {error}",
   "app_title": "Ethics Assistant",
-  "app_subtitle": "Your guide to ethical decision-making based on professional principles",
+  "app_subtitle": "Your guide to Trusteeship AI Ethics",
   "application_error": "🚨 **Application Error**:",
   "ask_your_ethics_question": "💬 Ask Your Ethics Question",
   "auth_error": "Authentication error. Please check your OpenAI API key.",
